@@ -143,8 +143,13 @@ class Trainer:
                 video_sample_n_frames=getattr(config, "video_sample_n_frames", config.num_frames),
                 video_repeat=getattr(config, "video_repeat", 1),
                 image_sample_size=getattr(config, "image_sample_size", getattr(config, "video_sample_size", config.h)),
+                text_drop_ratio=getattr(config, "text_drop_ratio", 0.1),
                 enable_bucket=getattr(config, "enable_bucket", True),
+                video_length_drop_start=getattr(config, "video_length_drop_start", 0.0),
+                video_length_drop_end=getattr(config, "video_length_drop_end", 1.0),
+                enable_inpaint=getattr(config, "add_inpaint_info", False),
                 enable_camera_info=getattr(config, "train_mode", "control_ref") == "control_camera_ref",
+                enable_subject_info=getattr(config, "enable_subject_info", False),
             )
             sampler = torch.utils.data.distributed.DistributedSampler(
                 dataset,

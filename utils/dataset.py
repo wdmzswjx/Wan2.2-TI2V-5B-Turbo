@@ -4,8 +4,10 @@ import numpy as np
 import torch
 import lmdb
 import json
+import csv
 from PIL import Image
 import os
+import torchvision.transforms as transforms
 import torchvision.transforms.functional as TF
 import pandas as pd
 import cv2
@@ -304,25 +306,56 @@ class ImageVideoControlDataset(Dataset):
         video_sample_n_frames=121,
         video_repeat=1,
         image_sample_size=None,
+        text_drop_ratio=0.1,
         enable_bucket=True,
+        video_length_drop_start=0.0,
+        video_length_drop_end=1.0,
+        enable_inpaint=False,
         enable_camera_info=False,
+        return_file_name=False,
+        enable_subject_info=False,
     ):
         self.meta_path = Path(train_data_meta)
         self.train_data_dir = Path(train_data_dir) if train_data_dir else self.meta_path.parent
-        self.video_sample_size = video_sample_size
+        self.video_sample_size = tuple(video_sample_size) if not isinstance(video_sample_size, int) else (video_sample_size, video_sample_size)
         self.video_sample_stride = max(int(video_sample_stride), 1)
         self.video_sample_n_frames = int(video_sample_n_frames)
-        self.video_repeat = max(int(video_repeat), 1)
-        self.image_sample_size = image_sample_size or video_sample_size
+        self.video_repeat = int(video_repeat)
+        self.image_sample_size = tuple(image_sample_size or video_sample_size) if not isinstance(image_sample_size or video_sample_size, int) else (image_sample_size or video_sample_size, image_sample_size or video_sample_size)
         self.enable_bucket = enable_bucket
+        self.text_drop_ratio = text_drop_ratio
+        self.video_length_drop_start = video_length_drop_start
+        self.video_length_drop_end = video_length_drop_end
+        self.enable_inpaint = enable_inpaint
         self.enable_camera_info = enable_camera_info
-        self.dataset = self
-        self.items = self._load_metadata(self.meta_path) * self.video_repeat
+        self.return_file_name = return_file_name
+        self.enable_subject_info = enable_subject_info
+        self.larger_side_of_image_and_video = max(min(self.image_sample_size), min(self.video_sample_size))
+        raw_dataset = self._load_metadata(self.meta_path)
+        if self.video_repeat > 0:
+            self.dataset = [data for data in raw_dataset if data.get("type", "image") != "video"]
+            for _ in range(self.video_repeat):
+                self.dataset.extend([data for data in raw_dataset if data.get("type", "image") == "video"])
+        else:
+            self.dataset = raw_dataset
+        self.length = len(self.dataset)
+        self.video_transforms = transforms.Compose([
+            transforms.Resize(min(self.video_sample_size)),
+            transforms.CenterCrop(self.video_sample_size),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True),
+        ])
+        self.image_transforms = transforms.Compose([
+            transforms.Resize(min(self.image_sample_size)),
+            transforms.CenterCrop(self.image_sample_size),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
+        ])
 
     def _load_metadata(self, meta_path):
         suffix = meta_path.suffix.lower()
         if suffix == ".csv":
-            rows = pd.read_csv(meta_path).fillna("").to_dict("records")
+            with open(meta_path, encoding="utf-8") as csvfile:
+                rows = list(csv.DictReader(csvfile))
         elif suffix == ".jsonl":
             with open(meta_path, encoding="utf-8") as f:
                 rows = [json.loads(line) for line in f if line.strip()]
@@ -335,7 +368,7 @@ class ImageVideoControlDataset(Dataset):
         return rows
 
     def __len__(self):
-        return len(self.items)
+        return self.length
 
     def _get_value(self, item, names, default=""):
         for name in names:
@@ -352,7 +385,23 @@ class ImageVideoControlDataset(Dataset):
             return candidate
         return self.meta_path.parent / path
 
-    def _read_video_or_image(self, path):
+    def _resize_frames_to_larger_side(self, frames):
+        resized_frames = []
+        for frame in frames:
+            height, width = frame.shape[:2]
+            if min(height, width) == self.larger_side_of_image_and_video:
+                resized_frames.append(frame)
+                continue
+            if height < width:
+                new_height = self.larger_side_of_image_and_video
+                new_width = int(width * new_height / max(height, 1))
+            else:
+                new_width = self.larger_side_of_image_and_video
+                new_height = int(height * new_width / max(width, 1))
+            resized_frames.append(cv2.resize(frame, (new_width, new_height), interpolation=cv2.INTER_LINEAR))
+        return np.array(resized_frames)
+
+    def _read_frames(self, path, frame_indices=None):
         path = self._resolve_path(path)
         if path.is_dir():
             image_files = sorted(
@@ -360,46 +409,121 @@ class ImageVideoControlDataset(Dataset):
             )
             if not image_files:
                 raise ValueError(f"No image frames found in {path}")
+            if frame_indices is not None:
+                image_files = [image_files[min(int(index), len(image_files) - 1)] for index in frame_indices]
             frames = [cv2.cvtColor(cv2.imread(str(p), cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB) for p in image_files]
         elif path.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp", ".webp"}:
             frame = cv2.cvtColor(cv2.imread(str(path), cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB)
             frames = [frame]
         else:
             reader = decord.VideoReader(uri=path.as_posix())
-            indices = list(range(0, len(reader), self.video_sample_stride))
-            if not indices:
+            if frame_indices is None:
+                min_sample_n_frames = min(
+                    self.video_sample_n_frames,
+                    int(len(reader) * (self.video_length_drop_end - self.video_length_drop_start) // self.video_sample_stride),
+                )
+                if min_sample_n_frames == 0:
+                    raise ValueError(f"No frames in video: {path}")
+                video_length = int(self.video_length_drop_end * len(reader))
+                clip_length = min(video_length, (min_sample_n_frames - 1) * self.video_sample_stride + 1)
+                start_idx = int(self.video_length_drop_start * len(reader))
+                frame_indices = np.linspace(start_idx, start_idx + clip_length - 1, min_sample_n_frames, dtype=int)
+            if len(frame_indices) == 0:
                 raise ValueError(f"Video has no frames: {path}")
-            indices = indices[: self.video_sample_n_frames]
-            frames = reader.get_batch(indices).asnumpy()
-            return self._pad_frames(frames)
-        return self._pad_frames(np.stack(frames, axis=0))
+            frame_indices = [min(int(index), len(reader) - 1) for index in frame_indices]
+            frames = reader.get_batch(frame_indices).asnumpy()
+            return self._resize_frames_to_larger_side(frames), np.array(frame_indices, dtype=int)
+        frames = self._resize_frames_to_larger_side(np.stack(frames, axis=0))
+        return frames, np.arange(frames.shape[0], dtype=int)
 
-    def _pad_frames(self, frames):
-        if frames.shape[0] >= self.video_sample_n_frames:
-            return frames[: self.video_sample_n_frames]
-        pad = np.repeat(frames[-1:], self.video_sample_n_frames - frames.shape[0], axis=0)
-        return np.concatenate([frames, pad], axis=0)
+    def _to_non_bucket_video(self, frames, sample_size):
+        tensor = torch.from_numpy(frames).permute(0, 3, 1, 2).contiguous().float() / 255.0
+        return _resize_crop_normalize_video(tensor, sample_size, normalize=True)
+
+    def get_batch(self, idx):
+        data_info = self.dataset[idx % len(self.dataset)]
+        data_type = data_info.get("type", "image")
+        text = self._get_value(data_info, ["text", "caption", "prompt"])
+        if random.random() < self.text_drop_ratio:
+            text = ""
+        pixel_path = self._get_value(data_info, ["file_path", "path", "video_path", "image_path", "file"])
+        control_path = self._get_value(data_info, ["control_file_path", "control_path", "control_video_path", "control_image_path"], "")
+        mask_path = self._get_value(data_info, ["mask_path", "control_mask_path"], "")
+        if pixel_path == "":
+            raise ValueError(f"Sample {idx} is missing file_path/path: {data_info}")
+
+        if data_type == "video":
+            pixel_values, frame_indices = self._read_frames(pixel_path)
+            if not self.enable_bucket:
+                pixel_values = self._to_non_bucket_video(pixel_values, self.video_sample_size)
+            if mask_path:
+                control_mask_values, _ = self._read_frames(mask_path, frame_indices)
+                control_mask_values = control_mask_values[:, :, :, 0:1]
+            else:
+                control_mask_values = np.zeros_like(pixel_values)[:, :, :, 0:1] if self.enable_bucket else torch.zeros_like(pixel_values[:, :1]).permute(0, 2, 3, 1).cpu().numpy()
+
+            control_camera_values = None
+            if self.enable_camera_info and control_path.lower().endswith(".txt"):
+                control_pixel_values = np.zeros_like(pixel_values) if self.enable_bucket else torch.zeros_like(pixel_values)
+            elif control_path:
+                control_pixel_values, _ = self._read_frames(control_path, frame_indices)
+                if not self.enable_bucket:
+                    control_pixel_values = self._to_non_bucket_video(control_pixel_values, self.video_sample_size)
+            else:
+                control_pixel_values = np.zeros_like(pixel_values) if self.enable_bucket else torch.zeros_like(pixel_values)
+            subject_image = None
+            return pixel_values, control_pixel_values, control_mask_values, subject_image, control_camera_values, text, "video"
+
+        image = Image.open(self._resolve_path(pixel_path)).convert("RGB")
+        if self.enable_bucket:
+            pixel_values = np.expand_dims(np.array(image), 0)
+            pixel_values = self._resize_frames_to_larger_side(pixel_values)
+        else:
+            pixel_values = self.image_transforms(image).unsqueeze(0)
+        if control_path:
+            control_image = Image.open(self._resolve_path(control_path)).convert("RGB")
+            if self.enable_bucket:
+                control_pixel_values = np.expand_dims(np.array(control_image), 0)
+                control_pixel_values = self._resize_frames_to_larger_side(control_pixel_values)
+            else:
+                control_pixel_values = self.image_transforms(control_image).unsqueeze(0)
+        else:
+            control_pixel_values = np.zeros_like(pixel_values) if self.enable_bucket else torch.zeros_like(pixel_values)
+        control_mask_values = np.zeros_like(pixel_values)[:, :, :, 0:1] if self.enable_bucket else torch.zeros_like(pixel_values[:, :1]).permute(0, 2, 3, 1).cpu().numpy()
+        subject_image = None
+        return pixel_values, control_pixel_values, control_mask_values, subject_image, None, text, "image"
 
     def __getitem__(self, index):
-        item = self.items[index]
-        text = self._get_value(item, ["text", "caption", "prompt"])
-        pixel_path = self._get_value(item, ["path", "video_path", "image_path", "file", "file_path"])
-        if pixel_path == "":
-            raise ValueError(f"Sample {index} is missing a video/image path: {item}")
-        control_path = self._get_value(
-            item,
-            ["control_path", "control_file_path", "control_video_path", "control_image_path"],
-            pixel_path,
-        )
-        example = {
-            "pixel_values": self._read_video_or_image(pixel_path),
-            "control_pixel_values": self._read_video_or_image(control_path),
-            "text": text,
-            "data_type": "image" if str(pixel_path).lower().endswith((".jpg", ".jpeg", ".png", ".bmp", ".webp")) else "video",
-        }
-        if self.enable_camera_info:
-            example["control_camera_values"] = None
-        return example
+        data_type = self.dataset[index % len(self.dataset)].get("type", "image")
+        while True:
+            try:
+                data_info = self.dataset[index % len(self.dataset)]
+                if data_info.get("type", "image") != data_type:
+                    raise ValueError("data_type_local != data_type")
+                pixel_values, control_pixel_values, control_mask_values, subject_image, control_camera_values, text, data_type = self.get_batch(index)
+                if data_type == "video" and len(pixel_values) < 30:
+                    index = random.randint(0, self.length - 1)
+                    continue
+                sample = {
+                    "pixel_values": pixel_values,
+                    "control_pixel_values": control_pixel_values,
+                    "control_mask_values": control_mask_values,
+                    "subject_image": subject_image,
+                    "text": text,
+                    "data_type": data_type,
+                    "idx": index,
+                }
+                if self.enable_camera_info:
+                    sample["control_camera_values"] = control_camera_values
+                if self.enable_inpaint and not self.enable_bucket:
+                    mask = torch.ones_like(pixel_values[:, :1])
+                    sample["mask_pixel_values"] = pixel_values * (1 - mask)
+                    sample["mask"] = mask
+                    sample["clip_pixel_values"] = (pixel_values[0].permute(1, 2, 0).contiguous() * 0.5 + 0.5) * 255
+                return sample
+            except Exception as exc:
+                print(exc, self.dataset[index % len(self.dataset)])
+                index = random.randint(0, self.length - 1)
 
 
 class ImageVideoSampler(torch.utils.data.BatchSampler):
