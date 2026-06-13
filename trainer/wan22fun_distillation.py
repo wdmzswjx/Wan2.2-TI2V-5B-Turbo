@@ -138,11 +138,11 @@ class Trainer:
             dataset = ImageVideoControlDataset(
                 train_data_meta,
                 getattr(config, "train_data_dir", None),
-                video_sample_size=getattr(config, "video_sample_size", config.h),
+                video_sample_size=getattr(config, "video_sample_size", 704),
                 video_sample_stride=getattr(config, "video_sample_stride", 1),
-                video_sample_n_frames=getattr(config, "video_sample_n_frames", config.num_frames),
+                video_sample_n_frames=getattr(config, "video_sample_n_frames", 121),
                 video_repeat=getattr(config, "video_repeat", 1),
-                image_sample_size=getattr(config, "image_sample_size", getattr(config, "video_sample_size", config.h)),
+                image_sample_size=getattr(config, "image_sample_size", getattr(config, "video_sample_size", 704)),
                 text_drop_ratio=getattr(config, "text_drop_ratio", 0.1),
                 enable_bucket=getattr(config, "enable_bucket", True),
                 video_length_drop_start=getattr(config, "video_length_drop_start", 0.1),
@@ -186,9 +186,9 @@ class Trainer:
             dataset = ODERegressionCSVDataset(
                 config.data_path, 
                 max_pair=int(1e8), 
-                num_frames=config.num_frames,
-                h=config.h,
-                w=config.w,
+                num_frames=getattr(config, "video_sample_n_frames", 121),
+                h=getattr(config, "video_sample_size", 704),
+                w=getattr(config, "video_sample_size", 704),
             )
                 
             sampler = OffsetDistributedSampler(
@@ -350,8 +350,11 @@ class Trainer:
         if control_latents is not None:
             image_or_video_shape = list(control_latents.shape)
         else:
-            image_or_video_shape = list(self.config.image_or_video_shape)
-            image_or_video_shape[2:] = list(wan22_image_latent.shape[2:])
+            image_or_video_shape = [
+                batch_size,
+                getattr(self.config, "num_training_frames", wan22_image_latent.shape[1]),
+                *list(wan22_image_latent.shape[2:]),
+            ]
         image_or_video_shape[0] = batch_size
 
         # Step 2: Extract the conditional infos
