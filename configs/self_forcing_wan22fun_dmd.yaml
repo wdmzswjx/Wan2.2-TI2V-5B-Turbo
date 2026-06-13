@@ -85,8 +85,8 @@ video_sample_stride: 1
 video_sample_n_frames: 121
 video_repeat: 1
 text_drop_ratio: 0.1
-video_length_drop_start: 0.0
-video_length_drop_end: 1.0
+video_length_drop_start: 0.1
+video_length_drop_end: 0.9
 enable_bucket: true
 random_hw_adapt: true
 training_with_video_token_length: true

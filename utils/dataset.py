@@ -308,8 +308,8 @@ class ImageVideoControlDataset(Dataset):
         image_sample_size=None,
         text_drop_ratio=0.1,
         enable_bucket=True,
-        video_length_drop_start=0.0,
-        video_length_drop_end=1.0,
+        video_length_drop_start=0.1,
+        video_length_drop_end=0.9,
         enable_inpaint=False,
         enable_camera_info=False,
         return_file_name=False,
@@ -426,7 +426,9 @@ class ImageVideoControlDataset(Dataset):
                     raise ValueError(f"No frames in video: {path}")
                 video_length = int(self.video_length_drop_end * len(reader))
                 clip_length = min(video_length, (min_sample_n_frames - 1) * self.video_sample_stride + 1)
-                start_idx = int(self.video_length_drop_start * len(reader))
+                start_min = int(self.video_length_drop_start * video_length)
+                start_max = max(video_length - clip_length, start_min)
+                start_idx = random.randint(start_min, start_max) if video_length != clip_length else 0
                 frame_indices = np.linspace(start_idx, start_idx + clip_length - 1, min_sample_n_frames, dtype=int)
             if len(frame_indices) == 0:
                 raise ValueError(f"Video has no frames: {path}")
@@ -448,7 +450,6 @@ class ImageVideoControlDataset(Dataset):
             text = ""
         pixel_path = self._get_value(data_info, ["file_path", "path", "video_path", "image_path", "file"])
         control_path = self._get_value(data_info, ["control_file_path", "control_path", "control_video_path", "control_image_path"], "")
-        mask_path = self._get_value(data_info, ["mask_path", "control_mask_path"], "")
         if pixel_path == "":
             raise ValueError(f"Sample {idx} is missing file_path/path: {data_info}")
 
@@ -456,11 +457,6 @@ class ImageVideoControlDataset(Dataset):
             pixel_values, frame_indices = self._read_frames(pixel_path)
             if not self.enable_bucket:
                 pixel_values = self._to_non_bucket_video(pixel_values, self.video_sample_size)
-            if mask_path:
-                control_mask_values, _ = self._read_frames(mask_path, frame_indices)
-                control_mask_values = control_mask_values[:, :, :, 0:1]
-            else:
-                control_mask_values = np.zeros_like(pixel_values)[:, :, :, 0:1] if self.enable_bucket else torch.zeros_like(pixel_values[:, :1]).permute(0, 2, 3, 1).cpu().numpy()
 
             control_camera_values = None
             if self.enable_camera_info and control_path.lower().endswith(".txt"):
@@ -472,7 +468,7 @@ class ImageVideoControlDataset(Dataset):
             else:
                 control_pixel_values = np.zeros_like(pixel_values) if self.enable_bucket else torch.zeros_like(pixel_values)
             subject_image = None
-            return pixel_values, control_pixel_values, control_mask_values, subject_image, control_camera_values, text, "video"
+            return pixel_values, control_pixel_values, subject_image, control_camera_values, text, "video"
 
         image = Image.open(self._resolve_path(pixel_path)).convert("RGB")
         if self.enable_bucket:
@@ -489,9 +485,8 @@ class ImageVideoControlDataset(Dataset):
                 control_pixel_values = self.image_transforms(control_image).unsqueeze(0)
         else:
             control_pixel_values = np.zeros_like(pixel_values) if self.enable_bucket else torch.zeros_like(pixel_values)
-        control_mask_values = np.zeros_like(pixel_values)[:, :, :, 0:1] if self.enable_bucket else torch.zeros_like(pixel_values[:, :1]).permute(0, 2, 3, 1).cpu().numpy()
         subject_image = None
-        return pixel_values, control_pixel_values, control_mask_values, subject_image, None, text, "image"
+        return pixel_values, control_pixel_values, subject_image, None, text, "image"
 
     def __getitem__(self, index):
         data_type = self.dataset[index % len(self.dataset)].get("type", "image")
@@ -500,14 +495,10 @@ class ImageVideoControlDataset(Dataset):
                 data_info = self.dataset[index % len(self.dataset)]
                 if data_info.get("type", "image") != data_type:
                     raise ValueError("data_type_local != data_type")
-                pixel_values, control_pixel_values, control_mask_values, subject_image, control_camera_values, text, data_type = self.get_batch(index)
-                if data_type == "video" and len(pixel_values) < 30:
-                    index = random.randint(0, self.length - 1)
-                    continue
+                pixel_values, control_pixel_values, subject_image, control_camera_values, text, data_type = self.get_batch(index)
                 sample = {
                     "pixel_values": pixel_values,
                     "control_pixel_values": control_pixel_values,
-                    "control_mask_values": control_mask_values,
                     "subject_image": subject_image,
                     "text": text,
                     "data_type": data_type,
