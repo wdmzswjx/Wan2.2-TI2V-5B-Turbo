@@ -1,4 +1,5 @@
 import os
+import math
 import types
 from typing import List, Optional
 import torch
@@ -419,6 +420,21 @@ class WanDiffusionWrapper(torch.nn.Module):
 
         self.post_init()
 
+    def get_seq_len(self, image_or_video: torch.Tensor) -> int:
+        """Infer transformer sequence length from a repo-layout latent.
+
+        ``image_or_video`` is expected in the wrapper's public layout
+        ``[B, F, C, H, W]``.  Wan/Wan2.2 patchify with the model's 3D
+        ``patch_size`` after the wrapper converts to ``[B, C, F, H, W]``.
+        """
+        patch_size = getattr(self.model, "patch_size", (1, 2, 2))
+        frames, height, width = image_or_video.shape[1], image_or_video.shape[-2], image_or_video.shape[-1]
+        return (
+            math.ceil(frames / patch_size[0])
+            * math.ceil(height / patch_size[1])
+            * math.ceil(width / patch_size[2])
+        )
+
     def enable_gradient_checkpointing(self) -> None:
         self.model.enable_gradient_checkpointing()
 
@@ -523,6 +539,8 @@ class WanDiffusionWrapper(torch.nn.Module):
 
         if "2.2" in self.model_name and wan22_input_timestep is not None:
             input_timestep = wan22_input_timestep
+        seq_len = self.get_seq_len(noisy_image_or_video)
+        self.seq_len = seq_len
 
         if y is not None and y.ndim == 5 and y.shape[1] == noisy_image_or_video.shape[1]:
             y = y.permute(0, 2, 1, 3, 4).contiguous()
@@ -533,7 +551,7 @@ class WanDiffusionWrapper(torch.nn.Module):
             flow_pred = self.model(
                 noisy_image_or_video.permute(0, 2, 1, 3, 4),
                 t=input_timestep, context=prompt_embeds,
-                seq_len=self.seq_len,
+                seq_len=seq_len,
                 kv_cache=kv_cache,
                 crossattn_cache=crossattn_cache,
                 current_start=current_start,
@@ -549,7 +567,7 @@ class WanDiffusionWrapper(torch.nn.Module):
                 flow_pred = self.model(
                     noisy_image_or_video.permute(0, 2, 1, 3, 4),
                     t=input_timestep, context=prompt_embeds,
-                    seq_len=self.seq_len,
+                    seq_len=seq_len,
                     clean_x=clean_x.permute(0, 2, 1, 3, 4),
                     aug_t=aug_t,
                     clip_fea=clip_fea,
@@ -562,7 +580,7 @@ class WanDiffusionWrapper(torch.nn.Module):
                     flow_pred, logits = self.model(
                         noisy_image_or_video.permute(0, 2, 1, 3, 4),
                         t=input_timestep, context=prompt_embeds,
-                        seq_len=self.seq_len,
+                        seq_len=seq_len,
                         classify_mode=True,
                         register_tokens=self._register_tokens,
                         cls_pred_branch=self._cls_pred_branch,
@@ -578,7 +596,7 @@ class WanDiffusionWrapper(torch.nn.Module):
                     flow_pred = self.model(
                         noisy_image_or_video.permute(0, 2, 1, 3, 4),
                         t=input_timestep, context=prompt_embeds,
-                        seq_len=self.seq_len,
+                        seq_len=seq_len,
                         clip_fea=clip_fea,
                         y=y,
                         y_camera=y_camera,

@@ -83,7 +83,7 @@ class Wan22FunDMD(DMD):
         model_input = (1.0 - mask2) * wan22_image_latent + mask2 * noisy_latent
         model_input = model_input.to(device=self.device, dtype=self.dtype)
 
-        seq_len = self.generator.seq_len
+        seq_len = self.generator.get_seq_len(noisy_latent)
         image_token_timestep = sample_timestep[:, None, None, None].to(
             device=noisy_latent.device, dtype=torch.float32
         )

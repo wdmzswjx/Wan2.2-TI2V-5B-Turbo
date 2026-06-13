@@ -69,11 +69,15 @@ class BidirectionalTrainingPipeline(torch.nn.Module):
                 mask2 = torch.stack(mask2, dim=0) # torch.Size([1, 31, 48, 44, 80])
                 noisy_image_or_video = (1. - mask2) * wan22_image_latent + mask2 * noisy_image_or_video
                 noisy_image_or_video = noisy_image_or_video.to(noise.device, dtype=noise.dtype)
+                seq_len = self.generator.get_seq_len(noisy_image_or_video)
 
                 wan22_input_timestep = torch.tensor([timestep[0][0].item()], device=noise.device, dtype=noise.dtype)
                 temp_ts = (mask2[:, :, 0, ::2, ::2] * wan22_input_timestep)
                 temp_ts = temp_ts.reshape(temp_ts.shape[0], -1)
-                temp_ts = torch.cat([temp_ts, temp_ts.new_ones(self.generator.seq_len - temp_ts.size(1)) * wan22_input_timestep], dim=1)
+                temp_ts = torch.cat([
+                    temp_ts,
+                    temp_ts.new_ones(temp_ts.size(0), seq_len - temp_ts.size(1)) * wan22_input_timestep,
+                ], dim=1)
                 wan22_input_timestep = temp_ts.to(noise.device, dtype=torch.long)
             else:
                 mask1, mask2 = None, None
