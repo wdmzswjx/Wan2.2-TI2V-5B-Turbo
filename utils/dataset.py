@@ -271,9 +271,23 @@ class TextImagePairDataset(Dataset):
 class ODERegressionCSVDataset(Dataset):
     def __init__(self, data_path: str, max_pair: int = int(1e8), num_frames=81, h=480, w=832):
         self.max_pair = max_pair
+        self.data_path = Path(data_path)
         self.data = pd.read_csv(data_path)
+        if "text" not in self.data.columns:
+            raise ValueError(
+                f"Dataset CSV {data_path} must contain a 'text' column. "
+                f"Available columns: {list(self.data.columns)}"
+            )
+        if "path" not in self.data.columns and "video_path" in self.data.columns:
+            self.data["path"] = self.data["video_path"]
+        if "path" not in self.data.columns:
+            raise ValueError(
+                f"Dataset CSV {data_path} must contain a 'path' or 'video_path' column. "
+                f"Available columns: {list(self.data.columns)}"
+            )
         self.data["text"] = self.data["text"].fillna("")
         self.log_file = "log/datasets_error_log.txt"
+        os.makedirs(os.path.dirname(self.log_file), exist_ok=True)
         self.num_frames = num_frames
         self.h = h
         self.w = w
@@ -282,8 +296,10 @@ class ODERegressionCSVDataset(Dataset):
         return len(self.data)
 
     def _preprocess_video(self, sample) -> torch.Tensor:
-        path = sample["path"]
-        num_frames = sample["num_frames"]
+        path = str(sample["path"])
+        if not os.path.isabs(path) and not os.path.exists(path):
+            path = os.path.join(self.data_path.parent, path)
+        num_frames = int(sample["num_frames"])
         if num_frames < self.num_frames:
             raise ValueError(f"Error: num_frames < {self.num_frames}")
         frame_indices = list(range(self.num_frames))
