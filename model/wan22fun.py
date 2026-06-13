@@ -374,7 +374,6 @@ class Wan22FunDMD(DMD):
         if initial_latent is not None:
             conditional_dict["initial_latent"] = initial_latent
         noise_shape = self._repo_shape_from_condition_latent(y, image_or_video_shape)
-        self.generator.wan22fun_eta = getattr(self.args, "wan22fun_eta", 1.0)
         if wan22_image_latent is not None:
             noise_shape[0] = wan22_image_latent.shape[0]
             noise_shape[2:] = list(wan22_image_latent.shape[2:])

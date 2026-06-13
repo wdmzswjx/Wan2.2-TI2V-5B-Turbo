@@ -52,6 +52,35 @@ class BidirectionalTrainingPipeline(torch.nn.Module):
             sigma = sigma.unsqueeze(-1)
         return sigma
 
+
+    @staticmethod
+    def _image_latent_from_control_y(y, reference: torch.Tensor, vae_latent_channels: int = 48):
+        """Extract Wan2.2Fun first-frame injection latent from the tail of y.
+
+        Wan2.2Fun's control tensor can contain more than a plain reference
+        latent.  The reliable injection signal is the last VAE-latent block in
+        y, not a separately encoded first frame.  Return repo layout
+        ``[B, 1, C, H, W]`` so it broadcasts over the noisy sample frames.
+        """
+        if y is None:
+            return None
+        if isinstance(y, torch.Tensor) and y.ndim == 5:
+            if y.shape[1] == reference.shape[1] and y.shape[-2:] == reference.shape[-2:]:
+                return y[:, :1, -vae_latent_channels:].to(device=reference.device, dtype=reference.dtype)
+            if y.shape[2] == reference.shape[1] and y.shape[-2:] == reference.shape[-2:]:
+                return y[:, -vae_latent_channels:, :1].permute(0, 2, 1, 3, 4).contiguous().to(
+                    device=reference.device, dtype=reference.dtype
+                )
+        if isinstance(y, (list, tuple)) and len(y) > 0 and isinstance(y[0], torch.Tensor):
+            first = y[0]
+            if first.ndim == 4 and first.shape[0] == reference.shape[1]:
+                stacked = torch.stack([item[:1, -vae_latent_channels:] for item in y], dim=0)
+                return stacked.to(device=reference.device, dtype=reference.dtype)
+            if first.ndim == 4 and first.shape[1] == reference.shape[1]:
+                stacked = torch.stack([item[-vae_latent_channels:, :1].permute(1, 0, 2, 3) for item in y], dim=0)
+                return stacked.to(device=reference.device, dtype=reference.dtype)
+        return None
+
     def inference_with_trajectory(self, noise: torch.Tensor, clip_fea, y, y_camera=None, full_ref=None, wan22_image_latent=None, **conditional_dict) -> torch.Tensor:
         """
         Perform inference on the given noise and text prompts.
@@ -80,7 +109,10 @@ class BidirectionalTrainingPipeline(torch.nn.Module):
             if "2.2" in self.generator.model_name:
                 mask1, mask2 = masks_like(noisy_image_or_video, zero=True)
                 mask2 = torch.stack(mask2, dim=0) # torch.Size([1, 31, 48, 44, 80])
-                noisy_image_or_video = (1. - mask2) * wan22_image_latent + mask2 * noisy_image_or_video
+                control_image_latent = self._image_latent_from_control_y(y, noisy_image_or_video)
+                if control_image_latent is None:
+                    control_image_latent = wan22_image_latent
+                noisy_image_or_video = (1. - mask2) * control_image_latent + mask2 * noisy_image_or_video
                 noisy_image_or_video = noisy_image_or_video.to(noise.device, dtype=noise.dtype)
                 seq_len = self.generator.get_seq_len(noisy_image_or_video)
 
@@ -94,6 +126,7 @@ class BidirectionalTrainingPipeline(torch.nn.Module):
                 wan22_input_timestep = temp_ts.to(noise.device, dtype=torch.long)
             else:
                 mask1, mask2 = None, None
+                control_image_latent = wan22_image_latent
                 wan22_input_timestep = None
 
             if not exit_flag:
@@ -108,7 +141,7 @@ class BidirectionalTrainingPipeline(torch.nn.Module):
                         full_ref=full_ref,
                         wan22_input_timestep=wan22_input_timestep,
                         mask2=mask2,
-                        wan22_image_latent=wan22_image_latent,
+                        wan22_image_latent=control_image_latent,
                     )  # [B, F, C, H, W]
 
                     next_timestep = self.denoising_step_list[index + 1] * torch.ones(
@@ -117,11 +150,9 @@ class BidirectionalTrainingPipeline(torch.nn.Module):
                         sigma_next = self._sigma_for_timestep(next_timestep, denoised_pred)
                         sigma_current = self._sigma_for_timestep(timestep, noisy_image_or_video)
                         pred_epsilon = noisy_image_or_video + (1 - sigma_current) * flow_pred
-                        eta = float(getattr(self.generator, "wan22fun_eta", 1.0))
-                        add_eps = eta * pred_epsilon + ((max(0.0, 1.0 - eta ** 2)) ** 0.5) * torch.randn_like(pred_epsilon)
-                        noisy_image_or_video = (1 - sigma_next) * denoised_pred + sigma_next * add_eps
-                        if mask2 is not None and wan22_image_latent is not None:
-                            noisy_image_or_video = (1. - mask2) * wan22_image_latent + mask2 * noisy_image_or_video
+                        noisy_image_or_video = (1 - sigma_next) * denoised_pred + sigma_next * pred_epsilon
+                        if mask2 is not None and control_image_latent is not None:
+                            noisy_image_or_video = (1. - mask2) * control_image_latent + mask2 * noisy_image_or_video
                     else:
                         noisy_image_or_video = self.scheduler.add_noise(
                             denoised_pred.flatten(0, 1),
@@ -139,7 +170,7 @@ class BidirectionalTrainingPipeline(torch.nn.Module):
                     full_ref=full_ref,
                     wan22_input_timestep=wan22_input_timestep,
                     mask2=mask2,
-                    wan22_image_latent=wan22_image_latent,
+                    wan22_image_latent=control_image_latent,
                 )  # [B, F, C, H, W]
                 break
 

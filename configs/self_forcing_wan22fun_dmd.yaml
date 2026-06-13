@@ -66,7 +66,6 @@ initial_step: 0
 # Wan2.2Fun-specific conditioning policy.
 wan22fun_zero_first_frame_timestep: true
 wan22fun_mask_first_frame_loss: true
-wan22fun_eta: 1.0
 
 # Wan2.2Fun dataloader. Set train_data_meta/train_data_dir to your Wan2.2Fun
 # metadata and data root. Metadata supports text/caption/prompt plus

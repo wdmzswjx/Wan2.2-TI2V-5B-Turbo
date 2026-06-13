@@ -344,7 +344,9 @@ class Trainer:
         else:
             video_tensor = batch["pixel_values"].permute(0, 2, 1, 3, 4).contiguous().to(device=self.device, dtype=self.dtype)
         first_frame = video_tensor[:, :, :1, :, :]
-        wan22_image_latent = self.model.vae.encode_to_latent(first_frame) # torch.Size([1, 1, 48, 44, 80])
+        # Fallback only: Wan2.2Fun's real image-token injection latent is
+        # overwritten below from the tail VAE-latent block carried by y.
+        wan22_image_latent = self.model.vae.encode_to_latent(first_frame)
 
         control_latents = None
         denoise_latent_shape = None
@@ -368,6 +370,13 @@ class Trainer:
                     inpaint_latents = torch.cat([mask_latent_tokens, mask_latents], dim=2)
                     inpaint_latents = self._apply_t2v_inpaint_dropout(mask, inpaint_latents)
                     control_latents = torch.cat([control_latents, inpaint_latents], dim=2)
+
+                # Wan2.2Fun image-token injection should follow the reliable
+                # latent condition carried by y.  In the upstream control format
+                # the final VAE-latent block is the image/reference signal used
+                # for the first-frame token injection.
+                if control_latents.shape[2] >= 48:
+                    wan22_image_latent = control_latents[:, :1, -48:].contiguous()
 
             if "ref_pixel_values" in batch:
                 ref_video_tensor = batch["ref_pixel_values"].permute(0, 2, 1, 3, 4).contiguous().to(
