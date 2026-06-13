@@ -53,8 +53,6 @@ dfake_gen_update_ratio: 5
 distribution_loss: wan22fun
 trainer: score_distillation_wan22fun
 gradient_checkpointing: true
-num_frame_per_block: 31
-num_training_frames: 31
 load_raw_video: false
 model_kwargs:
   timestep_shift: 5.0

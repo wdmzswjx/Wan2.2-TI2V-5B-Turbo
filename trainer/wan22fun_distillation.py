@@ -352,7 +352,7 @@ class Trainer:
         else:
             image_or_video_shape = [
                 batch_size,
-                getattr(self.config, "num_training_frames", wan22_image_latent.shape[1]),
+                wan22_image_latent.shape[1],
                 *list(wan22_image_latent.shape[2:]),
             ]
         image_or_video_shape[0] = batch_size

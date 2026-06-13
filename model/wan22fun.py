@@ -304,6 +304,44 @@ class Wan22FunDMD(DMD):
         dmd_log_dict["wan22fun_distribution_matching_loss"] = dmd_loss.detach()
         return dmd_loss, dmd_log_dict
 
+
+    @staticmethod
+    def _repo_shape_from_condition_latent(y: Optional[torch.Tensor], fallback_shape) -> list:
+        """Infer repo-layout latent shape from Wan2.2Fun control latents.
+
+        Wan2.2Fun control latents are the same spatio-temporal latent grid as
+        the noisy sample.  Prefer them over static config/default frame counts
+        so changing dataset frames (for example 81 input frames -> 21 latent
+        frames) also changes the generated noise shape.
+        """
+        shape = list(fallback_shape)
+        if y is None:
+            return shape
+
+        if isinstance(y, torch.Tensor) and y.ndim == 5:
+            # Repo layout: [B, F, C, H, W].
+            if y.shape[1] == shape[1] and y.shape[2] == shape[2]:
+                return list(y.shape)
+            # Model layout: [B, C, F, H, W].
+            if y.shape[1] == shape[2]:
+                return [y.shape[0], y.shape[2], y.shape[1], y.shape[3], y.shape[4]]
+            # If the caller supplied a stale frame count in fallback_shape, the
+            # channel dimension still identifies repo layout unambiguously.
+            if y.shape[2] == shape[2]:
+                return list(y.shape)
+            return shape
+
+        if isinstance(y, (list, tuple)) and len(y) > 0:
+            first = y[0]
+            if isinstance(first, torch.Tensor) and first.ndim == 4:
+                # Per-sample repo layout: [F, C, H, W].
+                if first.shape[1] == shape[2]:
+                    return [len(y), first.shape[0], first.shape[1], first.shape[2], first.shape[3]]
+                # Per-sample model layout: [C, F, H, W].
+                if first.shape[0] == shape[2]:
+                    return [len(y), first.shape[1], first.shape[0], first.shape[2], first.shape[3]]
+        return shape
+
     def _run_generator(
         self,
         image_or_video_shape,
@@ -328,7 +366,10 @@ class Wan22FunDMD(DMD):
         conditional_dict = dict(conditional_dict)
         if initial_latent is not None:
             conditional_dict["initial_latent"] = initial_latent
-        noise_shape = list(image_or_video_shape)
+        noise_shape = self._repo_shape_from_condition_latent(y, image_or_video_shape)
+        if wan22_image_latent is not None:
+            noise_shape[0] = wan22_image_latent.shape[0]
+            noise_shape[2:] = list(wan22_image_latent.shape[2:])
 
         pred_image_or_video, denoised_timestep_from, denoised_timestep_to = self._consistency_backward_simulation(
             noise=torch.randn(noise_shape, device=self.device, dtype=self.dtype),
