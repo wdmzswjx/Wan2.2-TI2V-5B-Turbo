@@ -39,7 +39,7 @@ class BidirectionalTrainingPipeline(torch.nn.Module):
         dist.broadcast(indices, src=0)  # Broadcast the random indices to all ranks
         return indices.tolist()
 
-    def inference_with_trajectory(self, noise: torch.Tensor, clip_fea, y, wan22_image_latent, **conditional_dict) -> torch.Tensor:
+    def inference_with_trajectory(self, noise: torch.Tensor, clip_fea, y, y_camera=None, full_ref=None, wan22_image_latent=None, **conditional_dict) -> torch.Tensor:
         """
         Perform inference on the given noise and text prompts.
         Inputs:
@@ -87,6 +87,8 @@ class BidirectionalTrainingPipeline(torch.nn.Module):
                         timestep=timestep,
                         clip_fea=clip_fea,
                         y=y,
+                        y_camera=y_camera,
+                        full_ref=full_ref,
                         wan22_input_timestep=wan22_input_timestep,
                         mask2=mask2,
                         wan22_image_latent=wan22_image_latent,
@@ -106,6 +108,8 @@ class BidirectionalTrainingPipeline(torch.nn.Module):
                     timestep=timestep,
                     clip_fea=clip_fea,
                     y=y,
+                    y_camera=y_camera,
+                    full_ref=full_ref,
                     wan22_input_timestep=wan22_input_timestep,
                     mask2=mask2,
                     wan22_image_latent=wan22_image_latent,

@@ -121,6 +121,8 @@ class SelfForcingModel(BaseModel):
         initial_latent: torch.tensor = None,
         clip_fea: torch.Tensor = None,
         y: torch.Tensor = None,
+        y_camera: torch.Tensor = None,
+        full_ref: torch.Tensor = None,
         wan22_image_latent: torch.Tensor = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -169,6 +171,8 @@ class SelfForcingModel(BaseModel):
                               device=self.device, dtype=self.dtype),
             clip_fea=clip_fea,
             y=y,
+            y_camera=y_camera,
+            full_ref=full_ref,
             wan22_image_latent=wan22_image_latent,
             **conditional_dict
         )
@@ -204,8 +208,10 @@ class SelfForcingModel(BaseModel):
         self,
         noise: torch.Tensor,
         clip_fea: torch.Tensor,
-        y: torch.Tensor,
-        wan22_image_latent: torch.Tensor,
+        y: torch.Tensor = None,
+        y_camera: torch.Tensor = None,
+        full_ref: torch.Tensor = None,
+        wan22_image_latent: torch.Tensor = None,
         **conditional_dict: dict
     ) -> torch.Tensor:
         """
@@ -224,7 +230,7 @@ class SelfForcingModel(BaseModel):
             self._initialize_inference_pipeline()
 
         return self.inference_pipeline.inference_with_trajectory(
-            noise=noise, clip_fea=clip_fea, y=y, wan22_image_latent=wan22_image_latent, **conditional_dict
+            noise=noise, clip_fea=clip_fea, y=y, y_camera=y_camera, full_ref=full_ref, wan22_image_latent=wan22_image_latent, **conditional_dict
         )
 
     def _initialize_inference_pipeline(self):

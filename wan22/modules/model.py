@@ -450,6 +450,8 @@ class Wan22Model(ModelMixin, ConfigMixin):
         gan_ca_blocks=None,
         clip_fea=None,
         y=None,
+        y_camera=None,
+        full_ref=None,
     ):
         r"""
         Forward pass through the diffusion model

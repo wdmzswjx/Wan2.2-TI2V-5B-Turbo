@@ -651,6 +651,8 @@ class WanModel(ModelMixin, ConfigMixin):
         gan_ca_blocks=None,
         clip_fea=None,
         y=None,
+        y_camera=None,
+        full_ref=None,
     ):
         r"""
         Forward pass through the diffusion model
@@ -784,6 +786,8 @@ class WanModel(ModelMixin, ConfigMixin):
         cls_pred_branch,
         clip_fea=None,
         y=None,
+        y_camera=None,
+        full_ref=None,
     ):
         r"""
         Feature extraction through the diffusion model

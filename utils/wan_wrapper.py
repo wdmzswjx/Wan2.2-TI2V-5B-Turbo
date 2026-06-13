@@ -492,6 +492,8 @@ class WanDiffusionWrapper(torch.nn.Module):
         cache_start: Optional[int] = None,
         clip_fea: Optional[torch.Tensor] = None,
         y: Optional[torch.Tensor] = None,
+        y_camera: Optional[torch.Tensor] = None,
+        full_ref: Optional[torch.Tensor] = None,
         wan22_input_timestep: Optional[torch.Tensor] = None,
         mask2: Optional[torch.Tensor] = None,
         wan22_image_latent: Optional[torch.Tensor] = None,
@@ -507,6 +509,9 @@ class WanDiffusionWrapper(torch.nn.Module):
         if "2.2" in self.model_name and wan22_input_timestep is not None:
             input_timestep = wan22_input_timestep
 
+        if y is not None and y.ndim == 5 and y.shape[1] == noisy_image_or_video.shape[1]:
+            y = y.permute(0, 2, 1, 3, 4).contiguous()
+
         logits = None
         # X0 prediction
         if kv_cache is not None:
@@ -519,7 +524,9 @@ class WanDiffusionWrapper(torch.nn.Module):
                 current_start=current_start,
                 cache_start=cache_start,
                 clip_fea=clip_fea,
-                y=y
+                y=y,
+                y_camera=y_camera,
+                full_ref=full_ref
             ).permute(0, 2, 1, 3, 4)
         else:
             if clean_x is not None:
@@ -531,7 +538,9 @@ class WanDiffusionWrapper(torch.nn.Module):
                     clean_x=clean_x.permute(0, 2, 1, 3, 4),
                     aug_t=aug_t,
                     clip_fea=clip_fea,
-                    y=y
+                    y=y,
+                    y_camera=y_camera,
+                    full_ref=full_ref
                 ).permute(0, 2, 1, 3, 4)
             else:
                 if classify_mode:
@@ -545,7 +554,9 @@ class WanDiffusionWrapper(torch.nn.Module):
                         gan_ca_blocks=self._gan_ca_blocks,
                         concat_time_embeddings=concat_time_embeddings,
                         clip_fea=clip_fea,
-                        y=y
+                        y=y,
+                        y_camera=y_camera,
+                        full_ref=full_ref
                     )
                     flow_pred = flow_pred.permute(0, 2, 1, 3, 4)
                 else:
@@ -554,7 +565,9 @@ class WanDiffusionWrapper(torch.nn.Module):
                         t=input_timestep, context=prompt_embeds,
                         seq_len=self.seq_len,
                         clip_fea=clip_fea,
-                        y=y
+                        y=y,
+                        y_camera=y_camera,
+                        full_ref=full_ref
                     ).permute(0, 2, 1, 3, 4)
 
         pred_x0 = self._convert_flow_pred_to_x0(

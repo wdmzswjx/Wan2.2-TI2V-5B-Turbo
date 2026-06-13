@@ -721,6 +721,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         seq_len,
         clip_fea=None,
         y=None,
+        y_camera=None,
+        full_ref=None,
         kv_cache: dict = None,
         crossattn_cache: dict = None,
         current_start: int = 0,
@@ -854,6 +856,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         aug_t=None,
         clip_fea=None,
         y=None,
+        y_camera=None,
+        full_ref=None,
     ):
         r"""
         Forward pass through the diffusion model

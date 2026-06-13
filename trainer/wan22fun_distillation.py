@@ -319,6 +319,25 @@ class Trainer:
             video_tensor = batch["pixel_values"].permute(0, 2, 1, 3, 4).contiguous().to(device=self.device, dtype=self.dtype)
         first_frame = video_tensor[:, :, :1, :, :]
         wan22_image_latent = self.model.vae.encode_to_latent(first_frame) # torch.Size([1, 1, 48, 44, 80])
+
+        control_latents = None
+        full_ref = None
+        y_camera = None
+        with torch.no_grad():
+            if "control_pixel_values" in batch:
+                control_video_tensor = batch["control_pixel_values"].permute(0, 2, 1, 3, 4).contiguous().to(
+                    device=self.device, dtype=self.dtype
+                )
+                control_latents = self.model.vae.encode_to_latent(control_video_tensor).to(self.dtype)
+            if "ref_pixel_values" in batch:
+                ref_video_tensor = batch["ref_pixel_values"].permute(0, 2, 1, 3, 4).contiguous().to(
+                    device=self.device, dtype=self.dtype
+                )
+                ref_latents = self.model.vae.encode_to_latent(ref_video_tensor).to(self.dtype)
+                full_ref = ref_latents[:, 0].clone()
+            else:
+                full_ref = wan22_image_latent[:, 0].clone()
+
         clean_latent = None
         image_latent = None
 
@@ -346,7 +365,7 @@ class Trainer:
                 y = self.model.vae.run_vae_encoder(img)
             else:
                 clip_fea = None
-                y = None
+                y = control_latents
 
         # Step 3: Store gradients for the generator (if training the generator)
         if train_generator:
@@ -358,6 +377,8 @@ class Trainer:
                 initial_latent=image_latent if self.config.i2v else None,
                 clip_fea=clip_fea,
                 y=y,
+                y_camera=y_camera,
+                full_ref=full_ref,
                 wan22_image_latent=wan22_image_latent,
             )
 
@@ -383,6 +404,8 @@ class Trainer:
             initial_latent=image_latent if self.config.i2v else None,
             clip_fea=clip_fea,
             y=y,
+            y_camera=y_camera,
+            full_ref=full_ref,
             wan22_image_latent=wan22_image_latent,
         )
 

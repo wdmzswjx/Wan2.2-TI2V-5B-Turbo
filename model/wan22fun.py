@@ -115,6 +115,8 @@ class Wan22FunDMD(DMD):
         timestep: torch.Tensor,
         clip_fea: Optional[torch.Tensor] = None,
         y: Optional[torch.Tensor] = None,
+        y_camera: Optional[torch.Tensor] = None,
+        full_ref: Optional[torch.Tensor] = None,
         wan22_image_latent: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """Run a Wan2.2Fun score model and return ``flow_pred, pred_x0, mask2``."""
@@ -129,6 +131,8 @@ class Wan22FunDMD(DMD):
             timestep=timestep,
             clip_fea=clip_fea,
             y=y,
+            y_camera=y_camera,
+            full_ref=full_ref,
             wan22_input_timestep=wan22_input_timestep,
             mask2=mask2,
             wan22_image_latent=wan22_image_latent,
@@ -147,6 +151,8 @@ class Wan22FunDMD(DMD):
         guidance_scale: float,
         clip_fea: Optional[torch.Tensor] = None,
         y: Optional[torch.Tensor] = None,
+        y_camera: Optional[torch.Tensor] = None,
+        full_ref: Optional[torch.Tensor] = None,
         wan22_image_latent: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Return classifier-free guided x0 and the Wan2.2Fun loss mask."""
@@ -157,6 +163,8 @@ class Wan22FunDMD(DMD):
             timestep=timestep,
             clip_fea=clip_fea,
             y=y,
+            y_camera=y_camera,
+            full_ref=full_ref,
             wan22_image_latent=wan22_image_latent,
         )
         if guidance_scale == 0.0:
@@ -169,6 +177,8 @@ class Wan22FunDMD(DMD):
             timestep=timestep,
             clip_fea=clip_fea,
             y=y,
+            y_camera=y_camera,
+            full_ref=full_ref,
             wan22_image_latent=wan22_image_latent,
         )
         pred_cfg = pred_cond + (pred_cond - pred_uncond) * guidance_scale
@@ -186,6 +196,8 @@ class Wan22FunDMD(DMD):
         normalization: bool = True,
         clip_fea=None,
         y=None,
+        y_camera=None,
+        full_ref=None,
         wan22_image_latent=None,
     ) -> Tuple[torch.Tensor, dict]:
         """Compute DMD gradient with Wan2.2Fun conditioning."""
@@ -198,6 +210,8 @@ class Wan22FunDMD(DMD):
             guidance_scale=self.fake_guidance_scale,
             clip_fea=clip_fea,
             y=y,
+            y_camera=y_camera,
+            full_ref=full_ref,
             wan22_image_latent=wan22_image_latent,
         )
         pred_real_image, _ = self._cfg_wan22fun_x0(
@@ -209,6 +223,8 @@ class Wan22FunDMD(DMD):
             guidance_scale=self.real_guidance_scale,
             clip_fea=clip_fea,
             y=y,
+            y_camera=y_camera,
+            full_ref=full_ref,
             wan22_image_latent=wan22_image_latent,
         )
 
@@ -236,10 +252,91 @@ class Wan22FunDMD(DMD):
         denoised_timestep_to: int = 0,
         clip_fea: torch.Tensor = None,
         y: torch.Tensor = None,
+        y_camera: torch.Tensor = None,
+        full_ref: torch.Tensor = None,
         wan22_image_latent: torch.Tensor = None,
     ) -> Tuple[torch.Tensor, dict]:
-        loss, log_dict = super().compute_distribution_matching_loss(
-            image_or_video=image_or_video,
+        original_latent = image_or_video
+        batch_size, num_frame = image_or_video.shape[:2]
+
+        with torch.no_grad():
+            min_timestep = denoised_timestep_to if self.ts_schedule and denoised_timestep_to is not None else self.min_score_timestep
+            max_timestep = denoised_timestep_from if self.ts_schedule_max and denoised_timestep_from is not None else self.num_train_timestep
+            timestep = self._get_timestep(
+                min_timestep,
+                max_timestep,
+                batch_size,
+                num_frame,
+                self.num_frame_per_block,
+                uniform_timestep=True,
+            )
+            if self.timestep_shift > 1:
+                timestep = self.timestep_shift * (timestep / 1000) / (
+                    1 + (self.timestep_shift - 1) * (timestep / 1000)
+                ) * 1000
+            timestep = timestep.clamp(self.min_step, self.max_step)
+
+            noise = torch.randn_like(image_or_video)
+            noisy_latent = self.scheduler.add_noise(
+                image_or_video.flatten(0, 1),
+                noise.flatten(0, 1),
+                timestep.flatten(0, 1),
+            ).detach().unflatten(0, (batch_size, num_frame))
+
+            grad, dmd_log_dict = self._compute_kl_grad(
+                noisy_image_or_video=noisy_latent,
+                estimated_clean_image_or_video=original_latent,
+                timestep=timestep,
+                conditional_dict=conditional_dict,
+                unconditional_dict=unconditional_dict,
+                clip_fea=clip_fea,
+                y=y,
+                y_camera=y_camera,
+                full_ref=full_ref,
+                wan22_image_latent=wan22_image_latent,
+            )
+
+        target = (original_latent.double() - grad.double()).detach()
+        if gradient_mask is not None:
+            dmd_loss = 0.5 * F.mse_loss(original_latent.double()[gradient_mask], target[gradient_mask], reduction="mean")
+        else:
+            dmd_loss = 0.5 * F.mse_loss(original_latent.double(), target, reduction="mean")
+        dmd_log_dict["wan22fun_distribution_matching_loss"] = dmd_loss.detach()
+        return dmd_loss, dmd_log_dict
+
+    def generator_loss(
+        self,
+        image_or_video_shape,
+        conditional_dict: dict,
+        unconditional_dict: dict,
+        clean_latent: torch.Tensor,
+        initial_latent: torch.Tensor = None,
+        clip_fea: torch.Tensor = None,
+        y: torch.Tensor = None,
+        y_camera: torch.Tensor = None,
+        full_ref: torch.Tensor = None,
+        wan22_image_latent: torch.Tensor = None,
+    ) -> Tuple[torch.Tensor, dict]:
+        """Run Wan2.2Fun generator and compute DMD loss with control inputs.
+
+        This override is intentionally explicit so the Wan2.2Fun-specific
+        control latents (``y``), camera controls and ``full_ref`` are forwarded
+        through the self-forcing trajectory instead of relying on the base DMD
+        signature.
+        """
+        pred_image, gradient_mask, denoised_timestep_from, denoised_timestep_to = self._run_generator(
+            image_or_video_shape=image_or_video_shape,
+            conditional_dict=conditional_dict,
+            initial_latent=initial_latent,
+            clip_fea=clip_fea,
+            y=y,
+            y_camera=y_camera,
+            full_ref=full_ref,
+            wan22_image_latent=wan22_image_latent,
+        )
+
+        dmd_loss, dmd_log_dict = self.compute_distribution_matching_loss(
+            image_or_video=pred_image,
             conditional_dict=conditional_dict,
             unconditional_dict=unconditional_dict,
             gradient_mask=gradient_mask,
@@ -247,10 +344,11 @@ class Wan22FunDMD(DMD):
             denoised_timestep_to=denoised_timestep_to,
             clip_fea=clip_fea,
             y=y,
+            y_camera=y_camera,
+            full_ref=full_ref,
             wan22_image_latent=wan22_image_latent,
         )
-        log_dict["wan22fun_distribution_matching_loss"] = loss.detach()
-        return loss, log_dict
+        return dmd_loss, dmd_log_dict
 
     def critic_loss(
         self,
@@ -261,6 +359,8 @@ class Wan22FunDMD(DMD):
         initial_latent: torch.Tensor = None,
         clip_fea: torch.Tensor = None,
         y: torch.Tensor = None,
+        y_camera: torch.Tensor = None,
+        full_ref: torch.Tensor = None,
         wan22_image_latent: torch.Tensor = None,
     ) -> Tuple[torch.Tensor, dict]:
         """Train fake score on generated Wan2.2Fun samples using repo DMD API."""
@@ -271,6 +371,8 @@ class Wan22FunDMD(DMD):
                 initial_latent=initial_latent,
                 clip_fea=clip_fea,
                 y=y,
+                y_camera=y_camera,
+                full_ref=full_ref,
                 wan22_image_latent=wan22_image_latent,
             )
 
@@ -304,6 +406,8 @@ class Wan22FunDMD(DMD):
             timestep=critic_timestep,
             clip_fea=clip_fea,
             y=y,
+            y_camera=y_camera,
+            full_ref=full_ref,
             wan22_image_latent=wan22_image_latent,
         )
 
