@@ -75,9 +75,9 @@ wan22fun_mask_first_frame_loss: true
 
 # Wan2.2Fun dataloader. Set train_data_meta/train_data_dir to your Wan2.2Fun
 # metadata and data root. Metadata supports text/caption/prompt plus
-# path/video_path/image_path and optional control_path/control_video_path.
+# file_path/path/video_path/image_path and optional control_file_path/control_path.
 use_wan22fun_dataloader: true
-train_data_meta: data/MagicData.csv
+train_data_meta: data/3dgs_1110_with_skybox_fake/metadata.json
 train_data_dir: .
 video_sample_size: 704
 image_sample_size: 704
