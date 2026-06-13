@@ -387,13 +387,14 @@ class WanDiffusionWrapper(torch.nn.Module):
     ):
         super().__init__()
         self.model_name = model_name
+        self.use_wan22fun_model = use_wan22fun_model or "Wan2.2Fun" in model_name
         self.dim = 5120 if "14B" in model_name else 1536
 
         if is_causal:
             self.model = CausalWanModel.from_pretrained(
                 f"wan_models/{model_name}/", local_attn_size=local_attn_size, sink_size=sink_size)
         else:
-            if use_wan22fun_model or "Wan2.2Fun" in model_name:
+            if self.use_wan22fun_model:
                 model_root = pretrained_model_name_or_path or f"wan_models/{model_name}/"
                 model_path = os.path.join(model_root, transformer_sub_path) if transformer_sub_path else model_root
                 self.model = Wan22FunModel.from_pretrained(
@@ -531,11 +532,13 @@ class WanDiffusionWrapper(torch.nn.Module):
         if isinstance(y, torch.Tensor):
             if y.ndim != 5:
                 return y
-            # Repo layout: [B, F, C, H, W] -> model layout: [B, C, F, H, W].
-            if y.shape[1] == ref_frames and y.shape[2] == ref_channels:
+            # Repo layout: [B, F, C_y, H, W] -> model layout: [B, C_y, F, H, W].
+            # C_y can be larger than the noisy latent channels for Wan2.2Fun
+            # (e.g. control_latents + mask + mask_latents = 100 channels).
+            if y.shape[1] == ref_frames and y.shape[-2:] == reference.shape[-2:]:
                 return y.permute(0, 2, 1, 3, 4).contiguous()
-            # Already model layout: [B, C, F, H, W].
-            if y.shape[1] == ref_channels and y.shape[2] == ref_frames:
+            # Already model layout: [B, C_y, F, H, W].
+            if y.shape[2] == ref_frames and y.shape[-2:] == reference.shape[-2:]:
                 return y.contiguous()
             return y
 
@@ -544,12 +547,12 @@ class WanDiffusionWrapper(torch.nn.Module):
             changed = False
             for item in y:
                 if isinstance(item, torch.Tensor) and item.ndim == 4:
-                    # Repo per-sample layout: [F, C, H, W] -> [C, F, H, W].
-                    if item.shape[0] == ref_frames and item.shape[1] == ref_channels:
+                    # Repo per-sample layout: [F, C_y, H, W] -> [C_y, F, H, W].
+                    if item.shape[0] == ref_frames and item.shape[-2:] == reference.shape[-2:]:
                         prepared.append(item.permute(1, 0, 2, 3).contiguous())
                         changed = True
                         continue
-                    if item.shape[0] == ref_channels and item.shape[1] == ref_frames:
+                    if item.shape[1] == ref_frames and item.shape[-2:] == reference.shape[-2:]:
                         prepared.append(item.contiguous())
                         changed = True
                         continue

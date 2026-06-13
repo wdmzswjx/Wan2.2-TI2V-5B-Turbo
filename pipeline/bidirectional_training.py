@@ -39,6 +39,19 @@ class BidirectionalTrainingPipeline(torch.nn.Module):
         dist.broadcast(indices, src=0)  # Broadcast the random indices to all ranks
         return indices.tolist()
 
+
+    def _sigma_for_timestep(self, timestep: torch.Tensor, like: torch.Tensor) -> torch.Tensor:
+        scheduler_timesteps = self.scheduler.timesteps.to(device=like.device)
+        scheduler_sigmas = self.scheduler.sigmas.to(device=like.device)
+        if timestep.ndim == 2:
+            timestep = timestep[:, 0]
+        timestep = timestep.to(device=like.device, dtype=scheduler_timesteps.dtype)
+        step_indices = torch.argmin((scheduler_timesteps.unsqueeze(0) - timestep.unsqueeze(1)).abs(), dim=1)
+        sigma = scheduler_sigmas[step_indices].to(device=like.device, dtype=like.dtype)
+        while sigma.ndim < like.ndim:
+            sigma = sigma.unsqueeze(-1)
+        return sigma
+
     def inference_with_trajectory(self, noise: torch.Tensor, clip_fea, y, y_camera=None, full_ref=None, wan22_image_latent=None, **conditional_dict) -> torch.Tensor:
         """
         Perform inference on the given noise and text prompts.
@@ -85,7 +98,7 @@ class BidirectionalTrainingPipeline(torch.nn.Module):
 
             if not exit_flag:
                 with torch.no_grad():
-                    _, denoised_pred = self.generator(
+                    flow_pred, denoised_pred = self.generator(
                         noisy_image_or_video=noisy_image_or_video,
                         conditional_dict=conditional_dict,
                         timestep=timestep,
@@ -100,11 +113,21 @@ class BidirectionalTrainingPipeline(torch.nn.Module):
 
                     next_timestep = self.denoising_step_list[index + 1] * torch.ones(
                         noise.shape[:2], dtype=torch.long, device=noise.device)
-                    noisy_image_or_video = self.scheduler.add_noise(
-                        denoised_pred.flatten(0, 1),
-                        torch.randn_like(denoised_pred.flatten(0, 1)),
-                        next_timestep.flatten(0, 1)
-                    ).unflatten(0, denoised_pred.shape[:2])
+                    if getattr(self.generator, "use_wan22fun_model", False):
+                        sigma_next = self._sigma_for_timestep(next_timestep, denoised_pred)
+                        sigma_current = self._sigma_for_timestep(timestep, noisy_image_or_video)
+                        pred_epsilon = noisy_image_or_video + (1 - sigma_current) * flow_pred
+                        eta = float(getattr(self.generator, "wan22fun_eta", 1.0))
+                        add_eps = eta * pred_epsilon + ((max(0.0, 1.0 - eta ** 2)) ** 0.5) * torch.randn_like(pred_epsilon)
+                        noisy_image_or_video = (1 - sigma_next) * denoised_pred + sigma_next * add_eps
+                        if mask2 is not None and wan22_image_latent is not None:
+                            noisy_image_or_video = (1. - mask2) * wan22_image_latent + mask2 * noisy_image_or_video
+                    else:
+                        noisy_image_or_video = self.scheduler.add_noise(
+                            denoised_pred.flatten(0, 1),
+                            torch.randn_like(denoised_pred.flatten(0, 1)),
+                            next_timestep.flatten(0, 1)
+                        ).unflatten(0, denoised_pred.shape[:2])
             else:
                 _, denoised_pred = self.generator(
                     noisy_image_or_video=noisy_image_or_video,

@@ -20,6 +20,7 @@ import torch.distributed as dist
 from omegaconf import OmegaConf
 from model import CausVid, DMD, SiD, Wan22FunDMD
 import torch
+import torch.nn.functional as F
 import wandb
 import time
 import os
@@ -310,6 +311,26 @@ class Trainer:
             print("Model saved to", os.path.join(self.output_path,
                   f"checkpoint_model_{self.step:06d}", "model.pt"))
 
+
+    @staticmethod
+    def _build_wan22fun_mask_latents(mask, latents):
+        """Convert pixel-space masks [B,F,1,H,W] to latent mask tokens [B,F,4,h,w]."""
+        mask = mask.permute(0, 2, 1, 3, 4).contiguous()
+        mask = torch.cat([torch.repeat_interleave(mask[:, :, 0:1], repeats=4, dim=2), mask[:, :, 1:]], dim=2)
+        batch, _, frames4, height, width = mask.shape
+        mask = mask.view(batch, frames4 // 4, 4, height, width).transpose(1, 2).contiguous()
+        mask = F.interpolate(mask, size=latents.shape[1:2] + latents.shape[-2:], mode="trilinear", align_corners=True)
+        return mask.permute(0, 2, 1, 3, 4).contiguous().to(device=latents.device, dtype=latents.dtype)
+
+    @staticmethod
+    def _apply_t2v_inpaint_dropout(mask, inpaint_latents):
+        """Mirror Wan2.2Fun's t2v dropout while preserving inpaint channel count."""
+        is_all_mask = mask.reshape(mask.shape[0], -1).bool().all(dim=1)
+        keep = torch.ones(mask.shape[0], device=inpaint_latents.device, dtype=inpaint_latents.dtype)
+        random_drop = torch.rand(mask.shape[0], device=inpaint_latents.device) < 0.90
+        keep = torch.where(is_all_mask.to(inpaint_latents.device) & random_drop, torch.zeros_like(keep), keep)
+        return keep[:, None, None, None, None] * inpaint_latents
+
     def fwdbwd_one_step(self, batch, train_generator):
         self.model.eval()  # prevent any randomness (e.g. dropout)
 
@@ -326,6 +347,7 @@ class Trainer:
         wan22_image_latent = self.model.vae.encode_to_latent(first_frame) # torch.Size([1, 1, 48, 44, 80])
 
         control_latents = None
+        denoise_latent_shape = None
         full_ref = None
         y_camera = None
         with torch.no_grad():
@@ -334,6 +356,19 @@ class Trainer:
                     device=self.device, dtype=self.dtype
                 )
                 control_latents = self.model.vae.encode_to_latent(control_video_tensor).to(self.dtype)
+                denoise_latent_shape = list(control_latents.shape)
+
+                if "mask" in batch and "mask_pixel_values" in batch:
+                    mask = batch["mask"].to(device=self.device, dtype=self.dtype)
+                    mask_pixel_tensor = batch["mask_pixel_values"].permute(0, 2, 1, 3, 4).contiguous().to(
+                        device=self.device, dtype=self.dtype
+                    )
+                    mask_latents = self.model.vae.encode_to_latent(mask_pixel_tensor).to(self.dtype)
+                    mask_latent_tokens = self._build_wan22fun_mask_latents(mask, mask_latents)
+                    inpaint_latents = torch.cat([mask_latent_tokens, mask_latents], dim=2)
+                    inpaint_latents = self._apply_t2v_inpaint_dropout(mask, inpaint_latents)
+                    control_latents = torch.cat([control_latents, inpaint_latents], dim=2)
+
             if "ref_pixel_values" in batch:
                 ref_video_tensor = batch["ref_pixel_values"].permute(0, 2, 1, 3, 4).contiguous().to(
                     device=self.device, dtype=self.dtype
@@ -347,8 +382,8 @@ class Trainer:
         image_latent = None
 
         batch_size = len(text_prompts)
-        if control_latents is not None:
-            image_or_video_shape = list(control_latents.shape)
+        if denoise_latent_shape is not None:
+            image_or_video_shape = denoise_latent_shape
         else:
             image_or_video_shape = [
                 batch_size,

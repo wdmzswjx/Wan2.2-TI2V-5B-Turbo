@@ -329,6 +329,13 @@ class Wan22FunDMD(DMD):
             # channel dimension still identifies repo layout unambiguously.
             if y.shape[2] == shape[2]:
                 return list(y.shape)
+            # Wan2.2Fun y can be a richer condition tensor (for example
+            # control_latents + mask + mask_latents = 100 channels).  In that
+            # case y still carries the correct batch/frame/spatial grid, but the
+            # generated noisy sample must keep the VAE latent channel count from
+            # fallback_shape.
+            if y.shape[-2:] == tuple(shape[-2:]):
+                return [y.shape[0], y.shape[1], shape[2], y.shape[3], y.shape[4]]
             return shape
 
         if isinstance(y, (list, tuple)) and len(y) > 0:
@@ -367,6 +374,7 @@ class Wan22FunDMD(DMD):
         if initial_latent is not None:
             conditional_dict["initial_latent"] = initial_latent
         noise_shape = self._repo_shape_from_condition_latent(y, image_or_video_shape)
+        self.generator.wan22fun_eta = getattr(self.args, "wan22fun_eta", 1.0)
         if wan22_image_latent is not None:
             noise_shape[0] = wan22_image_latent.shape[0]
             noise_shape[2:] = list(wan22_image_latent.shape[2:])
