@@ -12,6 +12,7 @@ from wan.modules.t5 import umt5_xxl
 from wan.modules.clip import CLIPModel
 from wan.modules.causal_model import CausalWanModel
 from wan22.modules.model import Wan22Model
+from wan22fun.modules.model import Wan22FunModel
 from wan22.modules.vae2_2 import _video_vae as _video_vae_2_2
 
 class WanTextEncoder(torch.nn.Module):
@@ -376,7 +377,12 @@ class WanDiffusionWrapper(torch.nn.Module):
             timestep_shift=8.0,
             is_causal=False,
             local_attn_size=-1,
-            sink_size=0
+            sink_size=0,
+            use_wan22fun_model=False,
+            pretrained_model_name_or_path=None,
+            transformer_path=None,
+            transformer_additional_kwargs=None,
+            transformer_sub_path="transformer",
     ):
         super().__init__()
         self.model_name = model_name
@@ -386,7 +392,16 @@ class WanDiffusionWrapper(torch.nn.Module):
             self.model = CausalWanModel.from_pretrained(
                 f"wan_models/{model_name}/", local_attn_size=local_attn_size, sink_size=sink_size)
         else:
-            if "2.2" in model_name:
+            if use_wan22fun_model or "Wan2.2Fun" in model_name:
+                model_root = pretrained_model_name_or_path or f"wan_models/{model_name}/"
+                model_path = os.path.join(model_root, transformer_sub_path) if transformer_sub_path else model_root
+                self.model = Wan22FunModel.from_pretrained(
+                    model_path,
+                    transformer_additional_kwargs=transformer_additional_kwargs,
+                    transformer_path=transformer_path,
+                )
+                self.seq_len = 27280  # [1, 31, 48, 44, 80]
+            elif "2.2" in model_name:
                 self.model = Wan22Model.from_pretrained(f"wan_models/{model_name}/")
                 self.seq_len = 27280  # [1, 31, 48, 44, 80]
             else:

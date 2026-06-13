@@ -29,18 +29,28 @@ class BaseModel(nn.Module):
         self.real_model_name = getattr(args, "real_name", "Wan2.1-T2V-14B")
         self.fake_model_name = getattr(args, "fake_name", "Wan2.1-T2V-14B")
         self.generator_name = getattr(args, "generator_name", "Wan2.1-T2V-14B")
+        model_kwargs = getattr(args, "model_kwargs", {})
+        score_model_kwargs = model_kwargs if getattr(args, "distribution_loss", None) in ("wan22fun", "wan22fun_dmd") else {}
 
         self.generator = WanDiffusionWrapper(
-            **getattr(args, "model_kwargs", {}),
+            **model_kwargs,
             model_name=self.generator_name,
             is_causal=self.is_causal
         )
         self.generator.model.requires_grad_(True)
 
-        self.real_score = WanDiffusionWrapper(model_name=self.real_model_name, is_causal=False)
+        self.real_score = WanDiffusionWrapper(
+            **score_model_kwargs,
+            model_name=self.real_model_name,
+            is_causal=False,
+        )
         self.real_score.model.requires_grad_(False)
 
-        self.fake_score = WanDiffusionWrapper(model_name=self.fake_model_name, is_causal=False)
+        self.fake_score = WanDiffusionWrapper(
+            **score_model_kwargs,
+            model_name=self.fake_model_name,
+            is_causal=False,
+        )
         self.fake_score.model.requires_grad_(True)
 
         self.text_encoder = WanTextEncoder(model_name=self.generator_name)
