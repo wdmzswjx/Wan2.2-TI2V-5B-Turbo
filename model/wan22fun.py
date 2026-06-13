@@ -9,7 +9,9 @@ optimizer, EMA, dataloader and checkpointing code.
 from typing import Dict, Optional, Tuple
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
+from einops import rearrange
 
 from model.dmd import DMD
 from utils.dataset import masks_like
@@ -303,6 +305,84 @@ class Wan22FunDMD(DMD):
             dmd_loss = 0.5 * F.mse_loss(original_latent.double(), target, reduction="mean")
         dmd_log_dict["wan22fun_distribution_matching_loss"] = dmd_loss.detach()
         return dmd_loss, dmd_log_dict
+
+    def _run_generator(
+        self,
+        image_or_video_shape,
+        conditional_dict: dict,
+        initial_latent: torch.Tensor = None,
+        clip_fea: torch.Tensor = None,
+        y: torch.Tensor = None,
+        y_camera: torch.Tensor = None,
+        full_ref: torch.Tensor = None,
+        wan22_image_latent: torch.Tensor = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, int, int]:
+        """Wan2.2Fun-local generator runner with control/ref arguments.
+
+        Keep this method in the Wan2.2Fun implementation instead of depending on
+        ``DMD``/``SelfForcingModel`` signatures, so normal DMD training is not
+        affected by Wan2.2Fun-only arguments such as ``y_camera`` and
+        ``full_ref``.
+        """
+        assert getattr(self.args, "backward_simulation", True), "Backward simulation needs to be enabled"
+        conditional_dict = dict(conditional_dict)
+        if initial_latent is not None:
+            conditional_dict["initial_latent"] = initial_latent
+        if self.args.i2v:
+            noise_shape = [image_or_video_shape[0], image_or_video_shape[1] - 1, *image_or_video_shape[2:]]
+        else:
+            noise_shape = image_or_video_shape.copy()
+
+        latent_frames_num = 31 if "2.2" in self.generator.model_name else 21
+        min_num_frames = latent_frames_num - 1 if self.args.independent_first_frame else latent_frames_num
+        max_num_frames = self.num_training_frames - 1 if self.args.independent_first_frame else self.num_training_frames
+        assert max_num_frames % self.num_frame_per_block == 0
+        assert min_num_frames % self.num_frame_per_block == 0
+        max_num_blocks = max_num_frames // self.num_frame_per_block
+        min_num_blocks = min_num_frames // self.num_frame_per_block
+        num_generated_blocks = torch.randint(min_num_blocks, max_num_blocks + 1, (1,), device=self.device)
+        dist.broadcast(num_generated_blocks, src=0)
+        num_generated_blocks = num_generated_blocks.item()
+        num_generated_frames = num_generated_blocks * self.num_frame_per_block
+        if self.args.independent_first_frame and initial_latent is None:
+            num_generated_frames += 1
+            min_num_frames += 1
+        noise_shape[1] = num_generated_frames
+
+        pred_image_or_video, denoised_timestep_from, denoised_timestep_to = self._consistency_backward_simulation(
+            noise=torch.randn(noise_shape, device=self.device, dtype=self.dtype),
+            clip_fea=clip_fea,
+            y=y,
+            y_camera=y_camera,
+            full_ref=full_ref,
+            wan22_image_latent=wan22_image_latent,
+            **conditional_dict,
+        )
+
+        if pred_image_or_video.shape[1] > latent_frames_num:
+            with torch.no_grad():
+                latent_to_decode = pred_image_or_video[:, :-(latent_frames_num - 1), ...]
+                pixels = self.vae.decode_to_pixel(latent_to_decode)
+                frame = pixels[:, -1:, ...].to(self.dtype)
+                frame = rearrange(frame, "b t c h w -> b c t h w")
+                image_latent = self.vae.encode_to_latent(frame).to(self.dtype)
+            pred_image_or_video_last_clip = torch.cat(
+                [image_latent, pred_image_or_video[:, -(latent_frames_num - 1):, ...]], dim=1
+            )
+        else:
+            pred_image_or_video_last_clip = pred_image_or_video
+
+        if num_generated_frames != min_num_frames:
+            gradient_mask = torch.ones_like(pred_image_or_video_last_clip, dtype=torch.bool)
+            if self.args.independent_first_frame:
+                gradient_mask[:, :1] = False
+            else:
+                gradient_mask[:, :self.num_frame_per_block] = False
+        else:
+            gradient_mask = None
+
+        pred_image_or_video_last_clip = pred_image_or_video_last_clip.to(self.dtype)
+        return pred_image_or_video_last_clip, gradient_mask, denoised_timestep_from, denoised_timestep_to
 
     def generator_loss(
         self,
