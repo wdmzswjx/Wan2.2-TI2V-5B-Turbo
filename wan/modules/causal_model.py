@@ -499,7 +499,11 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         self.num_frame_per_block = 1
         self.independent_first_frame = False
 
-    def _set_gradient_checkpointing(self, module, value=False):
+    def _set_gradient_checkpointing(
+        self, module=None, value=False, enable=None, gradient_checkpointing_func=None
+    ):
+        if enable is not None:
+            value = enable
         self.gradient_checkpointing = value
 
     @staticmethod
