@@ -10,7 +10,7 @@ from utils.misc import (
 )
 import torch.distributed as dist
 from omegaconf import OmegaConf
-from model import CausVid, DMD, SiD
+from model import CausVid, DMD, SiD, Wan22FunDMD
 import torch
 import wandb
 import time
@@ -64,6 +64,8 @@ class Trainer:
             self.model = DMD(config, device=self.device)
         elif config.distribution_loss == "sid":
             self.model = SiD(config, device=self.device)
+        elif config.distribution_loss in ("wan22fun", "wan22fun_dmd"):
+            self.model = Wan22FunDMD(config, device=self.device)
         else:
             raise ValueError("Invalid distribution matching loss")
 
