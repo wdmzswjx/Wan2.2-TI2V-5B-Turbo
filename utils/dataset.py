@@ -1,5 +1,5 @@
 from utils.lmdb import get_array_shape_from_lmdb, retrieve_row_from_lmdb
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, RandomSampler
 import numpy as np
 import torch
 import lmdb
@@ -13,6 +13,7 @@ import random
 from pathlib import Path
 import decord
 from torchvision.transforms.functional import resize
+import torch.nn.functional as F
 from torch.utils.data.distributed import DistributedSampler
 
 class OffsetDistributedSampler(DistributedSampler):
@@ -266,6 +267,192 @@ class TextImagePairDataset(Dataset):
             'origin_size': (item['origin_width'], item['origin_height']),
             'idx': idx
         }
+
+
+class ImageVideoControlDataset(Dataset):
+    """Wan2.2Fun-style image/video dataset with optional control frames.
+
+    The metadata file can be CSV or JSON/JSONL and should contain at least a
+    text/caption column plus a video/image path column. Supported aliases:
+    ``text``/``caption``/``prompt`` for prompts, ``path``/``video_path``/``file``
+    for target pixels, and ``control_path``/``control_video_path`` for control
+    pixels.  If no control path is provided, target pixels are reused as control
+    pixels, matching the common first-frame/control-ref bootstrap workflow.
+    """
+
+    def __init__(
+        self,
+        train_data_meta,
+        train_data_dir=None,
+        video_sample_size=704,
+        video_sample_stride=1,
+        video_sample_n_frames=121,
+        video_repeat=1,
+        image_sample_size=None,
+        enable_bucket=False,
+        enable_camera_info=False,
+    ):
+        self.meta_path = Path(train_data_meta)
+        self.train_data_dir = Path(train_data_dir) if train_data_dir else self.meta_path.parent
+        self.video_sample_size = video_sample_size
+        self.video_sample_stride = max(int(video_sample_stride), 1)
+        self.video_sample_n_frames = int(video_sample_n_frames)
+        self.video_repeat = max(int(video_repeat), 1)
+        self.image_sample_size = image_sample_size or video_sample_size
+        self.enable_bucket = enable_bucket
+        self.enable_camera_info = enable_camera_info
+        self.dataset = self
+        self.items = self._load_metadata(self.meta_path) * self.video_repeat
+
+    def _load_metadata(self, meta_path):
+        suffix = meta_path.suffix.lower()
+        if suffix == ".csv":
+            rows = pd.read_csv(meta_path).fillna("").to_dict("records")
+        elif suffix == ".jsonl":
+            with open(meta_path, encoding="utf-8") as f:
+                rows = [json.loads(line) for line in f if line.strip()]
+        else:
+            with open(meta_path, encoding="utf-8") as f:
+                data = json.load(f)
+            rows = data if isinstance(data, list) else data.get("data", [])
+        if not rows:
+            raise ValueError(f"No training samples found in {meta_path}")
+        return rows
+
+    def __len__(self):
+        return len(self.items)
+
+    def _get_value(self, item, names, default=""):
+        for name in names:
+            if name in item and item[name] != "":
+                return item[name]
+        return default
+
+    def _resolve_path(self, path):
+        path = Path(str(path))
+        if path.is_absolute():
+            return path
+        candidate = self.train_data_dir / path
+        if candidate.exists():
+            return candidate
+        return self.meta_path.parent / path
+
+    def _read_video_or_image(self, path):
+        path = self._resolve_path(path)
+        if path.is_dir():
+            image_files = sorted(
+                [p for p in path.iterdir() if p.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp", ".webp"}]
+            )
+            if not image_files:
+                raise ValueError(f"No image frames found in {path}")
+            frames = [cv2.cvtColor(cv2.imread(str(p), cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB) for p in image_files]
+        elif path.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp", ".webp"}:
+            frame = cv2.cvtColor(cv2.imread(str(path), cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB)
+            frames = [frame]
+        else:
+            reader = decord.VideoReader(uri=path.as_posix())
+            indices = list(range(0, len(reader), self.video_sample_stride))
+            if not indices:
+                raise ValueError(f"Video has no frames: {path}")
+            indices = indices[: self.video_sample_n_frames]
+            frames = reader.get_batch(indices).asnumpy()
+            return self._pad_frames(frames)
+        return self._pad_frames(np.stack(frames, axis=0))
+
+    def _pad_frames(self, frames):
+        if frames.shape[0] >= self.video_sample_n_frames:
+            return frames[: self.video_sample_n_frames]
+        pad = np.repeat(frames[-1:], self.video_sample_n_frames - frames.shape[0], axis=0)
+        return np.concatenate([frames, pad], axis=0)
+
+    def __getitem__(self, index):
+        item = self.items[index]
+        text = self._get_value(item, ["text", "caption", "prompt"])
+        pixel_path = self._get_value(item, ["path", "video_path", "image_path", "file", "file_path"])
+        if pixel_path == "":
+            raise ValueError(f"Sample {index} is missing a video/image path: {item}")
+        control_path = self._get_value(item, ["control_path", "control_video_path", "control_image_path"], pixel_path)
+        example = {
+            "pixel_values": self._read_video_or_image(pixel_path),
+            "control_pixel_values": self._read_video_or_image(control_path),
+            "text": text,
+            "data_type": "image" if str(pixel_path).lower().endswith((".jpg", ".jpeg", ".png", ".bmp", ".webp")) else "video",
+        }
+        if self.enable_camera_info:
+            example["control_camera_values"] = None
+        return example
+
+
+class ImageVideoSampler(torch.utils.data.BatchSampler):
+    def __init__(self, sampler, dataset, batch_size, drop_last=True):
+        super().__init__(sampler, batch_size=batch_size, drop_last=drop_last)
+        self.dataset = dataset
+
+
+class AspectRatioBatchImageVideoSampler(ImageVideoSampler):
+    def __init__(self, sampler, dataset, batch_size, train_folder=None, drop_last=True, aspect_ratios=None):
+        super().__init__(sampler, dataset=dataset, batch_size=batch_size, drop_last=drop_last)
+        self.train_folder = train_folder
+        self.aspect_ratios = aspect_ratios
+
+
+def wan22fun_worker_init_fn(seed):
+    seed = seed * 256
+
+    def _worker_init_fn(worker_id):
+        worker_seed = seed + worker_id
+        np.random.seed(worker_seed)
+        random.seed(worker_seed)
+
+    return _worker_init_fn
+
+
+def _resize_crop_normalize_video(video, sample_size):
+    if isinstance(sample_size, int):
+        sample_size = (sample_size, sample_size)
+    sample_size = tuple(int(x) for x in sample_size)
+    video = video.float() / 255.0
+    video = F.interpolate(video, size=sample_size, mode="bilinear", align_corners=False)
+    return video.sub_(0.5).div_(0.5)
+
+
+def wan22fun_collate_fn(config):
+    def _collate(examples):
+        sample_size = getattr(config, "fix_sample_size", None) or getattr(config, "video_sample_size", getattr(config, "h", 704))
+        if isinstance(sample_size, list):
+            sample_size = tuple(sample_size)
+        batch = {
+            "pixel_values": [],
+            "control_pixel_values": [],
+            "ref_pixel_values": [],
+            "clip_pixel_values": [],
+            "clip_idx": [],
+            "text": [],
+            "prompts": [],
+        }
+        for example in examples:
+            pixel_values = torch.from_numpy(example["pixel_values"]).permute(0, 3, 1, 2).contiguous()
+            control_pixel_values = torch.from_numpy(example["control_pixel_values"]).permute(0, 3, 1, 2).contiguous()
+            pixel_values = _resize_crop_normalize_video(pixel_values, sample_size)
+            control_pixel_values = _resize_crop_normalize_video(control_pixel_values, sample_size)
+            clip_idx = 0
+            ref_pixel_values = pixel_values[clip_idx: clip_idx + 1]
+            clip_pixel_values = ((pixel_values[clip_idx].permute(1, 2, 0).contiguous() * 0.5 + 0.5) * 255.0)
+            batch["pixel_values"].append(pixel_values)
+            batch["control_pixel_values"].append(control_pixel_values)
+            batch["ref_pixel_values"].append(ref_pixel_values)
+            batch["clip_pixel_values"].append(clip_pixel_values)
+            batch["clip_idx"].append(clip_idx)
+            batch["text"].append(example["text"])
+            batch["prompts"].append(example["text"])
+        batch["pixel_values"] = torch.stack(batch["pixel_values"])
+        batch["control_pixel_values"] = torch.stack(batch["control_pixel_values"])
+        batch["ref_pixel_values"] = torch.stack(batch["ref_pixel_values"])
+        batch["clip_pixel_values"] = torch.stack(batch["clip_pixel_values"])
+        batch["clip_idx"] = torch.tensor(batch["clip_idx"], dtype=torch.long)
+        return batch
+
+    return _collate
 
 
 class ODERegressionCSVDataset(Dataset):
