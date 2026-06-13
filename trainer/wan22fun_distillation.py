@@ -347,7 +347,11 @@ class Trainer:
         image_latent = None
 
         batch_size = len(text_prompts)
-        image_or_video_shape = list(self.config.image_or_video_shape)
+        if control_latents is not None:
+            image_or_video_shape = list(control_latents.shape)
+        else:
+            image_or_video_shape = list(self.config.image_or_video_shape)
+            image_or_video_shape[2:] = list(wan22_image_latent.shape[2:])
         image_or_video_shape[0] = batch_size
 
         # Step 2: Extract the conditional infos
