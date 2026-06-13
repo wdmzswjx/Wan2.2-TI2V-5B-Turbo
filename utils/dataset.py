@@ -16,6 +16,21 @@ from torchvision.transforms.functional import resize
 import torch.nn.functional as F
 from torch.utils.data.distributed import DistributedSampler
 
+SAMPLE_N_FRAMES_BUCKET_INTERVAL = 4
+SPATIAL_COMPRESSION_RATIO = 16
+ASPECT_RATIO_512 = {
+    "1:1": [512, 512],
+    "4:3": [512, 672],
+    "3:4": [672, 512],
+    "16:9": [512, 912],
+    "9:16": [912, 512],
+    "21:9": [512, 1192],
+    "9:21": [1192, 512],
+}
+ASPECT_RATIO_RANDOM_CROP_512 = ASPECT_RATIO_512
+ASPECT_RATIO_RANDOM_CROP_PROB = np.ones(len(ASPECT_RATIO_RANDOM_CROP_512)) / len(ASPECT_RATIO_RANDOM_CROP_512)
+
+
 class OffsetDistributedSampler(DistributedSampler):
     def __init__(self, dataset, initial_step=0, gpu_num=4, **kwargs):
         super().__init__(dataset, **kwargs)
@@ -411,49 +426,235 @@ def wan22fun_worker_init_fn(seed):
     return _worker_init_fn
 
 
-def _resize_crop_normalize_video(video, sample_size):
+def _align_to_spatial_compression(size, spatial_compression_ratio=SPATIAL_COMPRESSION_RATIO):
+    return [max(spatial_compression_ratio * 2, int(x / spatial_compression_ratio / 2) * spatial_compression_ratio * 2) for x in size]
+
+
+def _get_closest_ratio(height, width, ratios):
+    src_ratio = height / max(width, 1)
+    best_key = min(ratios, key=lambda key: abs((ratios[key][0] / max(ratios[key][1], 1)) - src_ratio))
+    return ratios[best_key], best_key
+
+
+def _center_crop_video(video, size):
+    th, tw = int(size[0]), int(size[1])
+    _, _, h, w = video.shape
+    top = max((h - th) // 2, 0)
+    left = max((w - tw) // 2, 0)
+    return video[:, :, top: top + th, left: left + tw]
+
+
+def _resize_crop_normalize_video(video, sample_size, normalize=True):
     if isinstance(sample_size, int):
         sample_size = (sample_size, sample_size)
     sample_size = tuple(int(x) for x in sample_size)
-    video = video.float() / 255.0
-    video = F.interpolate(video, size=sample_size, mode="bilinear", align_corners=False)
-    return video.sub_(0.5).div_(0.5)
+    if video.dtype != torch.float32:
+        video = video.float()
+    if video.max() > 2:
+        video = video / 255.0
+    h, w = video.shape[-2:]
+    th, tw = sample_size
+    if th / tw > h / max(w, 1):
+        resize_size = (th, int(w * th / max(h, 1)))
+    else:
+        resize_size = (int(h * tw / max(w, 1)), tw)
+    video = F.interpolate(video, size=resize_size, mode="bilinear", align_corners=False)
+    video = _center_crop_video(video, sample_size)
+    if normalize:
+        video = video.sub(0.5).div(0.5)
+    return video
+
+
+def _get_length_to_frame_num(config, token_length):
+    image_sample_size = getattr(config, "image_sample_size", getattr(config, "video_sample_size", 704))
+    video_sample_size = getattr(config, "video_sample_size", image_sample_size)
+    interval = getattr(config, "sample_n_frames_bucket_interval", SAMPLE_N_FRAMES_BUCKET_INTERVAL)
+    if image_sample_size > video_sample_size:
+        sample_sizes = list(range(video_sample_size, image_sample_size + 1, 128))
+        if sample_sizes[-1] != image_sample_size:
+            sample_sizes.append(image_sample_size)
+    else:
+        sample_sizes = [image_sample_size]
+    video_sample_n_frames = getattr(config, "video_sample_n_frames", getattr(config, "num_frames", 121))
+    return {
+        sample_size: int(min(token_length / sample_size / sample_size, video_sample_n_frames) // interval * interval + 1)
+        for sample_size in sample_sizes
+    }
+
+
+def _get_random_downsample_ratio(sample_size, image_ratio=None, all_choices=False, rng=None):
+    image_ratio = image_ratio or []
+    if sample_size >= 1536:
+        number_list = [1, 1.25, 1.5, 2, 2.5, 3] + image_ratio
+    elif sample_size >= 1024:
+        number_list = [1, 1.25, 1.5, 2] + image_ratio
+    elif sample_size >= 768:
+        number_list = [1, 1.25, 1.5] + image_ratio
+    elif sample_size >= 512:
+        number_list = [1] + image_ratio
+    else:
+        number_list = [1]
+    if all_choices:
+        return number_list
+    if len(number_list) == 1:
+        probs = np.array([1.0])
+    else:
+        probs = np.array([0.90] + [(0.10 / (len(number_list) - 1))] * (len(number_list) - 1))
+    return (rng or np.random).choice(number_list, p=probs)
+
+
+def _get_random_downsample_probability(choice_list, token_sample_size):
+    if len(choice_list) == 1:
+        return [1.0]
+    closest_index = min(range(len(choice_list)), key=lambda i: abs(choice_list[i] - token_sample_size))
+    probs = [0.50 / (len(choice_list) - 1)] * len(choice_list)
+    probs[closest_index] = 0.50
+    return probs
 
 
 def wan22fun_collate_fn(config):
     def _collate(examples):
-        sample_size = getattr(config, "fix_sample_size", None) or getattr(config, "video_sample_size", getattr(config, "h", 704))
-        if isinstance(sample_size, list):
-            sample_size = tuple(sample_size)
+        video_sample_n_frames = int(getattr(config, "video_sample_n_frames", getattr(config, "num_frames", 121)))
+        video_sample_size = int(getattr(config, "video_sample_size", getattr(config, "h", 704)))
+        image_sample_size = int(getattr(config, "image_sample_size", video_sample_size))
+        token_sample_size = int(getattr(config, "token_sample_size", video_sample_size))
+        interval = int(getattr(config, "sample_n_frames_bucket_interval", SAMPLE_N_FRAMES_BUCKET_INTERVAL))
+        spatial_compression_ratio = int(getattr(config, "spatial_compression_ratio", SPATIAL_COMPRESSION_RATIO))
+        random_hw_adapt = bool(getattr(config, "random_hw_adapt", True))
+        training_with_video_token_length = bool(getattr(config, "training_with_video_token_length", True))
+        random_ratio_crop = bool(getattr(config, "random_ratio_crop", False))
+        fix_sample_size = getattr(config, "fix_sample_size", None)
+        train_mode = getattr(config, "train_mode", "control_ref")
+        control_ref_image = getattr(config, "control_ref_image", "first_frame")
+        add_inpaint_info = bool(getattr(config, "add_inpaint_info", False))
+
+        target_token_length = video_sample_n_frames * token_sample_size * token_sample_size
+        length_to_frame_num = _get_length_to_frame_num(config, target_token_length)
+
+        first_pixel_value = examples[0]["pixel_values"]
+        _, height, width, _ = np.shape(first_pixel_value)
+        if random_hw_adapt:
+            if training_with_video_token_length:
+                local_min_size = np.min(
+                    np.array([
+                        np.mean(np.array([np.shape(example["pixel_values"])[1], np.shape(example["pixel_values"])[2]]))
+                        for example in examples
+                    ])
+                )
+                choice_list = [size for size in length_to_frame_num if size < local_min_size * 1.25]
+                if len(choice_list) == 0:
+                    choice_list = list(length_to_frame_num.keys())
+                probabilities = _get_random_downsample_probability(choice_list, token_sample_size)
+                local_video_sample_size = np.random.choice(choice_list, p=probabilities)
+                random_downsample_ratio = video_sample_size / local_video_sample_size
+                batch_video_length = length_to_frame_num[local_video_sample_size]
+            else:
+                random_downsample_ratio = _get_random_downsample_ratio(video_sample_size)
+                batch_video_length = video_sample_n_frames + interval
+        else:
+            random_downsample_ratio = 1
+            batch_video_length = video_sample_n_frames + interval
+
+        aspect_ratio_sample_size = {
+            key: [x / 512 * video_sample_size / random_downsample_ratio for x in ASPECT_RATIO_512[key]]
+            for key in ASPECT_RATIO_512.keys()
+        }
+        aspect_ratio_random_crop_sample_size = {
+            key: [x / 512 * video_sample_size / random_downsample_ratio for x in ASPECT_RATIO_RANDOM_CROP_512[key]]
+            for key in ASPECT_RATIO_RANDOM_CROP_512.keys()
+        }
+
+        if fix_sample_size is not None:
+            sample_size = _align_to_spatial_compression(fix_sample_size, spatial_compression_ratio)
+        elif random_ratio_crop:
+            random_sample_size = aspect_ratio_random_crop_sample_size[
+                np.random.choice(list(aspect_ratio_random_crop_sample_size.keys()), p=ASPECT_RATIO_RANDOM_CROP_PROB)
+            ]
+            sample_size = _align_to_spatial_compression(random_sample_size, spatial_compression_ratio)
+        else:
+            closest_size, _ = _get_closest_ratio(height, width, ratios=aspect_ratio_sample_size)
+            sample_size = _align_to_spatial_compression(closest_size, spatial_compression_ratio)
+
+        min_example_length = min(example["pixel_values"].shape[0] for example in examples)
+        batch_video_length = int(min(batch_video_length, min_example_length))
+        batch_video_length = (batch_video_length - 1) // interval * interval + 1
+        batch_video_length = max(batch_video_length, 1)
+
         batch = {
+            "target_token_length": target_token_length,
             "pixel_values": [],
             "control_pixel_values": [],
-            "ref_pixel_values": [],
-            "clip_pixel_values": [],
-            "clip_idx": [],
             "text": [],
             "prompts": [],
         }
+        if train_mode != "control":
+            batch["ref_pixel_values"] = []
+            batch["clip_pixel_values"] = []
+            batch["clip_idx"] = []
+        if train_mode == "control_camera_ref":
+            batch["control_camera_values"] = []
+        if add_inpaint_info:
+            batch["mask_pixel_values"] = []
+            batch["mask"] = []
+
         for example in examples:
             pixel_values = torch.from_numpy(example["pixel_values"]).permute(0, 3, 1, 2).contiguous()
             control_pixel_values = torch.from_numpy(example["control_pixel_values"]).permute(0, 3, 1, 2).contiguous()
-            pixel_values = _resize_crop_normalize_video(pixel_values, sample_size)
-            control_pixel_values = _resize_crop_normalize_video(control_pixel_values, sample_size)
-            clip_idx = 0
-            ref_pixel_values = pixel_values[clip_idx: clip_idx + 1]
-            clip_pixel_values = ((pixel_values[clip_idx].permute(1, 2, 0).contiguous() * 0.5 + 0.5) * 255.0)
+            pixel_values = _resize_crop_normalize_video(pixel_values, sample_size, normalize=True)
+            control_pixel_values = _resize_crop_normalize_video(control_pixel_values, sample_size, normalize=True)
+            pixel_values = pixel_values[:batch_video_length]
+            control_pixel_values = control_pixel_values[:batch_video_length]
             batch["pixel_values"].append(pixel_values)
             batch["control_pixel_values"].append(control_pixel_values)
-            batch["ref_pixel_values"].append(ref_pixel_values)
-            batch["clip_pixel_values"].append(clip_pixel_values)
-            batch["clip_idx"].append(clip_idx)
             batch["text"].append(example["text"])
             batch["prompts"].append(example["text"])
+
+            if train_mode == "control_camera_ref":
+                control_camera_values = example.get("control_camera_values", None)
+                if control_camera_values is None:
+                    camera_values = torch.zeros(
+                        (
+                            batch_video_length,
+                            6,
+                            control_pixel_values.shape[-2],
+                            control_pixel_values.shape[-1],
+                        ),
+                        dtype=control_pixel_values.dtype,
+                    )
+                else:
+                    camera_values = torch.as_tensor(control_camera_values).permute(0, 3, 1, 2).contiguous().float()
+                    camera_values = _resize_crop_normalize_video(camera_values, sample_size, normalize=False)[:batch_video_length]
+                batch["control_camera_values"].append(camera_values)
+
+            if train_mode != "control":
+                if control_ref_image == "first_frame" or len(pixel_values) == 1:
+                    clip_idx = 0
+                else:
+                    probs = np.array([0.40] + [(0.60 / (len(pixel_values) - 1))] * (len(pixel_values) - 1))
+                    clip_idx = int(np.random.choice(list(range(len(pixel_values))), p=probs))
+                ref_pixel_values = pixel_values[clip_idx: clip_idx + 1]
+                clip_pixel_values = ((pixel_values[clip_idx].permute(1, 2, 0).contiguous() * 0.5 + 0.5) * 255.0)
+                batch["ref_pixel_values"].append(ref_pixel_values)
+                batch["clip_pixel_values"].append(clip_pixel_values)
+                batch["clip_idx"].append(clip_idx)
+
+            if add_inpaint_info:
+                mask = torch.ones_like(pixel_values[:, :1])
+                mask_pixel_values = pixel_values * (1 - mask)
+                batch["mask_pixel_values"].append(mask_pixel_values)
+                batch["mask"].append(mask)
+
         batch["pixel_values"] = torch.stack(batch["pixel_values"])
         batch["control_pixel_values"] = torch.stack(batch["control_pixel_values"])
-        batch["ref_pixel_values"] = torch.stack(batch["ref_pixel_values"])
-        batch["clip_pixel_values"] = torch.stack(batch["clip_pixel_values"])
-        batch["clip_idx"] = torch.tensor(batch["clip_idx"], dtype=torch.long)
+        if train_mode != "control":
+            batch["ref_pixel_values"] = torch.stack(batch["ref_pixel_values"])
+            batch["clip_pixel_values"] = torch.stack(batch["clip_pixel_values"])
+            batch["clip_idx"] = torch.tensor(batch["clip_idx"], dtype=torch.long)
+        if train_mode == "control_camera_ref":
+            batch["control_camera_values"] = torch.stack(batch["control_camera_values"])
+        if add_inpaint_info:
+            batch["mask_pixel_values"] = torch.stack(batch["mask_pixel_values"])
+            batch["mask"] = torch.stack(batch["mask"])
         return batch
 
     return _collate
