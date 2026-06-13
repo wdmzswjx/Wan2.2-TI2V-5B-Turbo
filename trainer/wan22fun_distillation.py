@@ -1,7 +1,15 @@
 import gc
 import logging
 
-from utils.dataset import ODERegressionCSVDataset, cycle, OffsetDistributedSampler
+from utils.dataset import (
+    ODERegressionCSVDataset,
+    ImageVideoControlDataset,
+    ImageVideoSampler,
+    cycle,
+    OffsetDistributedSampler,
+    wan22fun_collate_fn,
+    wan22fun_worker_init_fn,
+)
 from utils.distributed import EMA_FSDP, fsdp_wrap, fsdp_state_dict, launch_distributed_job
 from utils.misc import (
     set_seed,
@@ -9,7 +17,7 @@ from utils.misc import (
 )
 import torch.distributed as dist
 from omegaconf import OmegaConf
-from model import CausVid, DMD, SiD
+from model import CausVid, DMD, SiD, Wan22FunDMD
 import torch
 import wandb
 import time
@@ -56,15 +64,10 @@ class Trainer:
 
         self.output_path = config.logdir
 
-        # Step 2: Initialize the model and optimizer
-        if config.distribution_loss == "causvid":
-            self.model = CausVid(config, device=self.device)
-        elif config.distribution_loss == "dmd":
-            self.model = DMD(config, device=self.device)
-        elif config.distribution_loss == "sid":
-            self.model = SiD(config, device=self.device)
-        else:
-            raise ValueError("Invalid distribution matching loss")
+        # Step 2: Initialize the Wan2.2Fun model and optimizer
+        if config.distribution_loss not in ("wan22fun", "wan22fun_dmd"):
+            raise ValueError("Wan22FunScoreDistillationTrainer requires distribution_loss='wan22fun'")
+        self.model = Wan22FunDMD(config, device=self.device)
 
         # Resume Training from Latest Checkpoint
         pretrained_ckpt_path, self.step = self.load(self.output_path)
@@ -127,26 +130,64 @@ class Trainer:
         )
 
         # Step 3: Initialize the dataloader
-        dataset = ODERegressionCSVDataset(
-            config.data_path, 
-            max_pair=int(1e8), 
-            num_frames=config.num_frames,
-            h=config.h,
-            w=config.w,
-        )
-            
-        sampler = OffsetDistributedSampler(
-            dataset,
-            initial_step=self.step,
-            gpu_num=self.world_size,
-            shuffle=False,
-            drop_last=True,
-        )
-        dataloader = torch.utils.data.DataLoader(
-            dataset,
-            batch_size=config.batch_size,
-            sampler=sampler,
-            num_workers=8)
+        if getattr(config, "use_wan22fun_dataloader", False):
+            train_data_meta = config.data_path or getattr(config, "train_data_meta", None)
+            if train_data_meta is None:
+                raise ValueError("Wan2.2Fun dataloader requires --data_path or train_data_meta")
+            dataset = ImageVideoControlDataset(
+                train_data_meta,
+                getattr(config, "train_data_dir", None),
+                video_sample_size=getattr(config, "video_sample_size", config.h),
+                video_sample_stride=getattr(config, "video_sample_stride", 1),
+                video_sample_n_frames=getattr(config, "video_sample_n_frames", config.num_frames),
+                video_repeat=getattr(config, "video_repeat", 1),
+                image_sample_size=getattr(config, "image_sample_size", getattr(config, "video_sample_size", config.h)),
+                enable_bucket=getattr(config, "enable_bucket", False),
+                enable_camera_info=getattr(config, "train_mode", "control_ref") == "control_camera_ref",
+            )
+            sampler = torch.utils.data.distributed.DistributedSampler(
+                dataset,
+                num_replicas=self.world_size,
+                rank=global_rank,
+                shuffle=True,
+                seed=config.seed,
+                drop_last=True,
+            )
+            batch_sampler = ImageVideoSampler(
+                sampler,
+                dataset,
+                batch_size=config.batch_size,
+                drop_last=True,
+            )
+            dataloader = torch.utils.data.DataLoader(
+                dataset,
+                batch_sampler=batch_sampler,
+                collate_fn=wan22fun_collate_fn(config),
+                persistent_workers=getattr(config, "dataloader_num_workers", 8) != 0,
+                num_workers=getattr(config, "dataloader_num_workers", 8),
+                worker_init_fn=wan22fun_worker_init_fn(config.seed + global_rank),
+            )
+        else:
+            dataset = ODERegressionCSVDataset(
+                config.data_path, 
+                max_pair=int(1e8), 
+                num_frames=config.num_frames,
+                h=config.h,
+                w=config.w,
+            )
+                
+            sampler = OffsetDistributedSampler(
+                dataset,
+                initial_step=self.step,
+                gpu_num=self.world_size,
+                shuffle=False,
+                drop_last=True,
+            )
+            dataloader = torch.utils.data.DataLoader(
+                dataset,
+                batch_size=config.batch_size,
+                sampler=sampler,
+                num_workers=8)
 
         if dist.get_rank() == 0:
             print("DATASET SIZE %d" % len(dataset))
@@ -261,8 +302,11 @@ class Trainer:
             torch.cuda.empty_cache()
 
         # Step 1: Get the next batch of text prompts
-        text_prompts = batch["prompts"]
-        video_tensor = batch["video"].to(device=self.device, dtype=self.dtype)
+        text_prompts = batch.get("prompts", batch.get("text"))
+        if "video" in batch:
+            video_tensor = batch["video"].to(device=self.device, dtype=self.dtype)
+        else:
+            video_tensor = batch["pixel_values"].permute(0, 2, 1, 3, 4).contiguous().to(device=self.device, dtype=self.dtype)
         first_frame = video_tensor[:, :, :1, :, :]
         wan22_image_latent = self.model.vae.encode_to_latent(first_frame) # torch.Size([1, 1, 48, 44, 80])
         clean_latent = None

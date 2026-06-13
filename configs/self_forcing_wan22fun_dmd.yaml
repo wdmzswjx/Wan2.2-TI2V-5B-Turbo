@@ -60,7 +60,7 @@ w: 1280
 
 # Select the new repo-native method.
 distribution_loss: wan22fun
-trainer: score_distillation_wan22
+trainer: score_distillation_wan22fun
 gradient_checkpointing: true
 num_frame_per_block: 31
 num_training_frames: 31
