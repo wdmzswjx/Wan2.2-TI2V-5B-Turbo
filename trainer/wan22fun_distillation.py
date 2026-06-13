@@ -5,6 +5,7 @@ from utils.dataset import (
     ODERegressionCSVDataset,
     ImageVideoControlDataset,
     ImageVideoSampler,
+    AspectRatioBatchImageVideoSampler,
     cycle,
     OffsetDistributedSampler,
     wan22fun_collate_fn,
@@ -142,7 +143,7 @@ class Trainer:
                 video_sample_n_frames=getattr(config, "video_sample_n_frames", config.num_frames),
                 video_repeat=getattr(config, "video_repeat", 1),
                 image_sample_size=getattr(config, "image_sample_size", getattr(config, "video_sample_size", config.h)),
-                enable_bucket=getattr(config, "enable_bucket", False),
+                enable_bucket=getattr(config, "enable_bucket", True),
                 enable_camera_info=getattr(config, "train_mode", "control_ref") == "control_camera_ref",
             )
             sampler = torch.utils.data.distributed.DistributedSampler(
@@ -153,12 +154,21 @@ class Trainer:
                 seed=config.seed,
                 drop_last=True,
             )
-            batch_sampler = ImageVideoSampler(
-                sampler,
-                dataset,
-                batch_size=config.batch_size,
-                drop_last=True,
-            )
+            if getattr(config, "enable_bucket", True):
+                batch_sampler = AspectRatioBatchImageVideoSampler(
+                    sampler,
+                    dataset.dataset,
+                    batch_size=config.batch_size,
+                    train_folder=getattr(config, "train_data_dir", None),
+                    drop_last=True,
+                )
+            else:
+                batch_sampler = ImageVideoSampler(
+                    sampler,
+                    dataset,
+                    batch_size=config.batch_size,
+                    drop_last=True,
+                )
             dataloader = torch.utils.data.DataLoader(
                 dataset,
                 batch_sampler=batch_sampler,

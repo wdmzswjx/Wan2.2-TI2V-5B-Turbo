@@ -289,7 +289,7 @@ class ImageVideoControlDataset(Dataset):
         video_sample_n_frames=121,
         video_repeat=1,
         image_sample_size=None,
-        enable_bucket=False,
+        enable_bucket=True,
         enable_camera_info=False,
     ):
         self.meta_path = Path(train_data_meta)
