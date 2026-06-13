@@ -510,6 +510,54 @@ class WanDiffusionWrapper(torch.nn.Module):
         flow_pred = (xt - x0_pred) / sigma_t
         return flow_pred.to(original_dtype)
 
+
+    @staticmethod
+    def _prepare_condition_latent_for_model(y, reference: torch.Tensor):
+        """Convert control latents to the underlying Wan model layout.
+
+        The repository-facing wrapper uses ``[B, F, C, H, W]`` latents, while
+        Wan/Wan2.2/Wan2.2Fun transformer implementations concatenate ``x`` and
+        ``y`` after converting ``x`` to per-sample ``[C, F, H, W]``.  Depending
+        on the caller, ``y`` may arrive either in repo layout, model layout, or
+        as a list of per-sample tensors.  Normalize only when the dimensions
+        clearly match the repo layout; leave already model-layout tensors intact.
+        """
+        if y is None:
+            return None
+
+        ref_frames = reference.shape[1]
+        ref_channels = reference.shape[2]
+
+        if isinstance(y, torch.Tensor):
+            if y.ndim != 5:
+                return y
+            # Repo layout: [B, F, C, H, W] -> model layout: [B, C, F, H, W].
+            if y.shape[1] == ref_frames and y.shape[2] == ref_channels:
+                return y.permute(0, 2, 1, 3, 4).contiguous()
+            # Already model layout: [B, C, F, H, W].
+            if y.shape[1] == ref_channels and y.shape[2] == ref_frames:
+                return y.contiguous()
+            return y
+
+        if isinstance(y, (list, tuple)):
+            prepared = []
+            changed = False
+            for item in y:
+                if isinstance(item, torch.Tensor) and item.ndim == 4:
+                    # Repo per-sample layout: [F, C, H, W] -> [C, F, H, W].
+                    if item.shape[0] == ref_frames and item.shape[1] == ref_channels:
+                        prepared.append(item.permute(1, 0, 2, 3).contiguous())
+                        changed = True
+                        continue
+                    if item.shape[0] == ref_channels and item.shape[1] == ref_frames:
+                        prepared.append(item.contiguous())
+                        changed = True
+                        continue
+                prepared.append(item)
+            return type(y)(prepared) if isinstance(y, tuple) else prepared if changed else y
+
+        return y
+
     def forward(
         self,
         noisy_image_or_video: torch.Tensor, conditional_dict: dict,
@@ -542,8 +590,7 @@ class WanDiffusionWrapper(torch.nn.Module):
         seq_len = self.get_seq_len(noisy_image_or_video)
         self.seq_len = seq_len
 
-        if y is not None and y.ndim == 5 and y.shape[1] == noisy_image_or_video.shape[1]:
-            y = y.permute(0, 2, 1, 3, 4).contiguous()
+        y = self._prepare_condition_latent_for_model(y, noisy_image_or_video)
 
         logits = None
         # X0 prediction
