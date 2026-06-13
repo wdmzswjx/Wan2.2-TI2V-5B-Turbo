@@ -330,7 +330,7 @@ class ImageVideoControlDataset(Dataset):
 
     def _resolve_path(self, path):
         path = Path(str(path))
-        if path.is_absolute():
+        if path.is_absolute() or path.exists():
             return path
         candidate = self.train_data_dir / path
         if candidate.exists():
@@ -371,7 +371,11 @@ class ImageVideoControlDataset(Dataset):
         pixel_path = self._get_value(item, ["path", "video_path", "image_path", "file", "file_path"])
         if pixel_path == "":
             raise ValueError(f"Sample {index} is missing a video/image path: {item}")
-        control_path = self._get_value(item, ["control_path", "control_video_path", "control_image_path"], pixel_path)
+        control_path = self._get_value(
+            item,
+            ["control_path", "control_file_path", "control_video_path", "control_image_path"],
+            pixel_path,
+        )
         example = {
             "pixel_values": self._read_video_or_image(pixel_path),
             "control_pixel_values": self._read_video_or_image(control_path),
