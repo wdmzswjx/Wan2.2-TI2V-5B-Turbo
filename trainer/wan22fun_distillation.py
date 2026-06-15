@@ -24,6 +24,8 @@ import torch.nn.functional as F
 import wandb
 import time
 import os
+import re
+import shutil
 
 
 class Trainer:
@@ -262,24 +264,38 @@ class Trainer:
         self.max_grad_norm_critic = getattr(config, "max_grad_norm_critic", 10.0)
         self.previous_time = None
 
+    @staticmethod
+    def _checkpoint_step(folder_name):
+        match = re.fullmatch(r"checkpoint_model_(\d+)", folder_name)
+        return int(match.group(1)) if match else -1
+
+    def _prune_old_checkpoints(self, keep_last=5):
+        if keep_last is None or keep_last <= 0 or not os.path.exists(self.output_path):
+            return
+        checkpoints = []
+        for folder_name in os.listdir(self.output_path):
+            step = self._checkpoint_step(folder_name)
+            path = os.path.join(self.output_path, folder_name)
+            if step >= 0 and os.path.isdir(path):
+                checkpoints.append((step, path))
+        checkpoints.sort(key=lambda item: item[0])
+        for _, path in checkpoints[:-keep_last]:
+            shutil.rmtree(path, ignore_errors=True)
+            print(f"Removed old checkpoint {path}")
+
     def load(self, out_path):
         # 1. 找到最新的checkpoint文件夹（按步数排序）
         if not os.path.exists(out_path):
             return None, 0
-        ckpt_folders = [f for f in os.listdir(out_path) if f.startswith("checkpoint_model_")]
+        ckpt_folders = [f for f in os.listdir(out_path) if self._checkpoint_step(f) >= 0]
         if not ckpt_folders:
             return None, 0
-        # 提取步数
-        def extract_step(folder_name):
-            import re
-            match = re.search(r"checkpoint_model_(\d+)", folder_name)
-            return int(match.group(1)) if match else -1
-        ckpt_folders.sort(key=extract_step)
+        ckpt_folders.sort(key=self._checkpoint_step)
         latest_ckpt_folder = ckpt_folders[-1]
 
         # 2. 读取model.pt和步数
         model_path = os.path.join(out_path, latest_ckpt_folder, "model.pt")
-        step = extract_step(latest_ckpt_folder)
+        step = self._checkpoint_step(latest_ckpt_folder)
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"{model_path} not found")
         return model_path, step
@@ -310,6 +326,9 @@ class Trainer:
                        f"checkpoint_model_{self.step:06d}", "model.pt"))
             print("Model saved to", os.path.join(self.output_path,
                   f"checkpoint_model_{self.step:06d}", "model.pt"))
+            self._prune_old_checkpoints(
+                keep_last=getattr(self.config, "max_checkpoints_to_keep", 5)
+            )
 
 
     @staticmethod
