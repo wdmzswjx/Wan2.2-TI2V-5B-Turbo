@@ -1,4 +1,5 @@
 from typing import Tuple
+import copy
 from einops import rearrange
 from torch import nn
 import torch.distributed as dist
@@ -25,31 +26,55 @@ class BaseModel(nn.Module):
                 timesteps = torch.cat((self.scheduler.timesteps.cpu(), torch.tensor([0], dtype=torch.float32)))
                 self.denoising_step_list = timesteps[1000 - self.denoising_step_list]
 
+    @staticmethod
+    def _freeze_model_init_value(value):
+        if hasattr(value, "items"):
+            return tuple(sorted((key, BaseModel._freeze_model_init_value(val)) for key, val in value.items()))
+        if isinstance(value, (list, tuple)):
+            return tuple(BaseModel._freeze_model_init_value(item) for item in value)
+        try:
+            hash(value)
+            return value
+        except TypeError:
+            return repr(value)
+
     def _initialize_models(self, args, device):
         self.real_model_name = getattr(args, "real_name", "Wan2.1-T2V-14B")
         self.fake_model_name = getattr(args, "fake_name", "Wan2.1-T2V-14B")
         self.generator_name = getattr(args, "generator_name", "Wan2.1-T2V-14B")
         model_kwargs = getattr(args, "model_kwargs", {})
         score_model_kwargs = model_kwargs if getattr(args, "distribution_loss", None) in ("wan22fun", "wan22fun_dmd") else {}
+        wrapper_cache = {}
 
-        self.generator = WanDiffusionWrapper(
-            **model_kwargs,
-            model_name=self.generator_name,
-            is_causal=self.is_causal
+        def get_wrapper(model_name, is_causal, kwargs):
+            cache_key = (model_name, is_causal, self._freeze_model_init_value(kwargs))
+            if cache_key not in wrapper_cache:
+                wrapper_cache[cache_key] = WanDiffusionWrapper(
+                    **kwargs,
+                    model_name=model_name,
+                    is_causal=is_causal,
+                )
+                return wrapper_cache[cache_key]
+            return copy.deepcopy(wrapper_cache[cache_key])
+
+        self.generator = get_wrapper(
+            self.generator_name,
+            self.is_causal,
+            model_kwargs,
         )
         self.generator.model.requires_grad_(True)
 
-        self.real_score = WanDiffusionWrapper(
-            **score_model_kwargs,
-            model_name=self.real_model_name,
-            is_causal=False,
+        self.real_score = get_wrapper(
+            self.real_model_name,
+            False,
+            score_model_kwargs,
         )
         self.real_score.model.requires_grad_(False)
 
-        self.fake_score = WanDiffusionWrapper(
-            **score_model_kwargs,
-            model_name=self.fake_model_name,
-            is_causal=False,
+        self.fake_score = get_wrapper(
+            self.fake_model_name,
+            False,
+            score_model_kwargs,
         )
         self.fake_score.model.requires_grad_(True)
 
