@@ -362,7 +362,8 @@ class CausalHead(nn.Module):
         # with amp.autocast(dtype=torch.float32):
         num_frames, frame_seqlen = e.shape[1], x.shape[1] // e.shape[1]
         e = (self.modulation.unsqueeze(1) + e).chunk(2, dim=2)
-        x = (self.head(self.norm(x).unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * (1 + e[1]) + e[0]))
+        head_input = self.norm(x).unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * (1 + e[1]) + e[0]
+        x = self.head(head_input.to(dtype=self.head.weight.dtype))
         return x
 
 

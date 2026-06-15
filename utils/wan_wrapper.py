@@ -402,6 +402,7 @@ class WanDiffusionWrapper(torch.nn.Module):
                     transformer_additional_kwargs=transformer_additional_kwargs,
                     transformer_path=transformer_path,
                 )
+                self._register_linear_dtype_hooks(self.model)
                 self.seq_len = 27280  # [1, 31, 48, 44, 80]
             elif "2.2" in model_name:
                 self.model = Wan22Model.from_pretrained(f"wan_models/{model_name}/")
@@ -420,6 +421,28 @@ class WanDiffusionWrapper(torch.nn.Module):
         self.scheduler.set_timesteps(1000, training=True)
 
         self.post_init()
+
+
+    @staticmethod
+    def _register_linear_dtype_hooks(model: torch.nn.Module) -> None:
+        """Make Wan2.2Fun Linear layers robust to fp32 checkpointed activations.
+
+        Some Wan2.2Fun blocks intentionally run norm/modulation in fp32, while
+        the loaded transformer weights can be bf16.  PyTorch Linear requires the
+        input and weight dtypes to match, so cast only Linear inputs to their
+        own weight dtype immediately before the matmul.
+        """
+        def _cast_linear_input(module, inputs):
+            if not inputs:
+                return inputs
+            first = inputs[0]
+            if torch.is_tensor(first) and first.is_floating_point() and first.dtype != module.weight.dtype:
+                return (first.to(module.weight.dtype), *inputs[1:])
+            return inputs
+
+        for module in model.modules():
+            if isinstance(module, torch.nn.Linear):
+                module.register_forward_pre_hook(_cast_linear_input)
 
     def get_seq_len(self, image_or_video: torch.Tensor) -> int:
         """Infer transformer sequence length from a repo-layout latent.

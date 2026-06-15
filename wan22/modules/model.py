@@ -298,9 +298,8 @@ class Head(nn.Module):
         # assert e.dtype == torch.float32
         # with torch.amp.autocast('cuda', dtype=torch.float32):
         e = (self.modulation.unsqueeze(0) + e.unsqueeze(2)).chunk(2, dim=2)
-        x = (
-            self.head(
-                self.norm(x) * (1 + e[1].squeeze(2)) + e[0].squeeze(2)))
+        head_input = self.norm(x) * (1 + e[1].squeeze(2)) + e[0].squeeze(2)
+        x = self.head(head_input.to(dtype=self.head.weight.dtype))
         return x
 
 
