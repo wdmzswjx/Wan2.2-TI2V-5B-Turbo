@@ -26,6 +26,76 @@ import time
 import os
 import re
 import shutil
+from collections import OrderedDict
+
+from safetensors.torch import save_file
+
+
+def _strip_checkpoint_wrapper_prefix(name):
+    """Remove wrappers added by FSDP/checkpointing before matching state keys."""
+    for prefix in ("_fsdp_wrapped_module.", "_checkpoint_wrapped_module.", "_orig_mod."):
+        name = name.replace(prefix, "")
+    return name
+
+
+def extract_generator_state_dict(
+    checkpoint,
+    use_ema=False,
+    transformer_only=True,
+):
+    """Extract generator weights from a Wan2.2Fun training checkpoint.
+
+    Args:
+        checkpoint: A checkpoint path or an already-loaded checkpoint dict.
+        use_ema: Extract ``generator_ema`` instead of ``generator`` when present.
+        transformer_only: Strip the WanDiffusionWrapper ``model.`` prefix so the
+            returned state dict can be loaded directly by the transformer model
+            (for example ``Wan22FunModel`` / ``Wan2_2Transformer3DModel``).
+
+    Returns:
+        An ``OrderedDict`` containing only the requested generator weights.
+    """
+    if isinstance(checkpoint, (str, os.PathLike)):
+        checkpoint = torch.load(checkpoint, map_location="cpu")
+
+    key = "generator_ema" if use_ema and "generator_ema" in checkpoint else "generator"
+    if key in checkpoint:
+        state_dict = checkpoint[key]
+    elif "model" in checkpoint:
+        state_dict = checkpoint["model"]
+    else:
+        state_dict = checkpoint
+
+    extracted = OrderedDict()
+    for name, tensor in state_dict.items():
+        clean_name = _strip_checkpoint_wrapper_prefix(name)
+        if transformer_only:
+            if not clean_name.startswith("model."):
+                continue
+            clean_name = clean_name[len("model."):]
+        extracted[clean_name] = tensor.detach().cpu() if torch.is_tensor(tensor) else tensor
+    return extracted
+
+
+def save_generator_for_transformer(
+    checkpoint_path,
+    output_path,
+    use_ema=False,
+    transformer_only=True,
+):
+    """Save generator weights in a format loadable by the raw transformer model."""
+    state_dict = extract_generator_state_dict(
+        checkpoint_path,
+        use_ema=use_ema,
+        transformer_only=transformer_only,
+    )
+    output_path = os.fspath(output_path)
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    if output_path.endswith(".safetensors"):
+        save_file(state_dict, output_path)
+    else:
+        torch.save(state_dict, output_path)
+    return output_path, len(state_dict)
 
 
 class Trainer:
