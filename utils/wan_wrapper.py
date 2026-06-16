@@ -1,4 +1,5 @@
 import os
+import math
 import types
 from typing import List, Optional
 import torch
@@ -12,6 +13,7 @@ from wan.modules.t5 import umt5_xxl
 from wan.modules.clip import CLIPModel
 from wan.modules.causal_model import CausalWanModel
 from wan22.modules.model import Wan22Model
+from wan22fun.modules.model import Wan22FunModel
 from wan22.modules.vae2_2 import _video_vae as _video_vae_2_2
 
 class WanTextEncoder(torch.nn.Module):
@@ -376,17 +378,33 @@ class WanDiffusionWrapper(torch.nn.Module):
             timestep_shift=8.0,
             is_causal=False,
             local_attn_size=-1,
-            sink_size=0
+            sink_size=0,
+            use_wan22fun_model=False,
+            pretrained_model_name_or_path=None,
+            transformer_path=None,
+            transformer_additional_kwargs=None,
+            transformer_sub_path="transformer",
     ):
         super().__init__()
         self.model_name = model_name
+        self.use_wan22fun_model = use_wan22fun_model or "Wan2.2Fun" in model_name
         self.dim = 5120 if "14B" in model_name else 1536
 
         if is_causal:
             self.model = CausalWanModel.from_pretrained(
                 f"wan_models/{model_name}/", local_attn_size=local_attn_size, sink_size=sink_size)
         else:
-            if "2.2" in model_name:
+            if self.use_wan22fun_model:
+                model_root = pretrained_model_name_or_path or f"wan_models/{model_name}/"
+                model_path = os.path.join(model_root, transformer_sub_path) if transformer_sub_path else model_root
+                self.model = Wan22FunModel.from_pretrained(
+                    model_path,
+                    transformer_additional_kwargs=transformer_additional_kwargs,
+                    transformer_path=transformer_path,
+                )
+                self._register_linear_dtype_hooks(self.model)
+                self.seq_len = 27280  # [1, 31, 48, 44, 80]
+            elif "2.2" in model_name:
                 self.model = Wan22Model.from_pretrained(f"wan_models/{model_name}/")
                 self.seq_len = 27280  # [1, 31, 48, 44, 80]
             else:
@@ -403,6 +421,43 @@ class WanDiffusionWrapper(torch.nn.Module):
         self.scheduler.set_timesteps(1000, training=True)
 
         self.post_init()
+
+
+    @staticmethod
+    def _register_linear_dtype_hooks(model: torch.nn.Module) -> None:
+        """Make Wan2.2Fun Linear layers robust to fp32 checkpointed activations.
+
+        Some Wan2.2Fun blocks intentionally run norm/modulation in fp32, while
+        the loaded transformer weights can be bf16.  PyTorch Linear requires the
+        input and weight dtypes to match, so cast only Linear inputs to their
+        own weight dtype immediately before the matmul.
+        """
+        def _cast_linear_input(module, inputs):
+            if not inputs:
+                return inputs
+            first = inputs[0]
+            if torch.is_tensor(first) and first.is_floating_point() and first.dtype != module.weight.dtype:
+                return (first.to(module.weight.dtype), *inputs[1:])
+            return inputs
+
+        for module in model.modules():
+            if isinstance(module, torch.nn.Linear):
+                module.register_forward_pre_hook(_cast_linear_input)
+
+    def get_seq_len(self, image_or_video: torch.Tensor) -> int:
+        """Infer transformer sequence length from a repo-layout latent.
+
+        ``image_or_video`` is expected in the wrapper's public layout
+        ``[B, F, C, H, W]``.  Wan/Wan2.2 patchify with the model's 3D
+        ``patch_size`` after the wrapper converts to ``[B, C, F, H, W]``.
+        """
+        patch_size = getattr(self.model, "patch_size", (1, 2, 2))
+        frames, height, width = image_or_video.shape[1], image_or_video.shape[-2], image_or_video.shape[-1]
+        return (
+            math.ceil(frames / patch_size[0])
+            * math.ceil(height / patch_size[1])
+            * math.ceil(width / patch_size[2])
+        )
 
     def enable_gradient_checkpointing(self) -> None:
         self.model.enable_gradient_checkpointing()
@@ -479,6 +534,56 @@ class WanDiffusionWrapper(torch.nn.Module):
         flow_pred = (xt - x0_pred) / sigma_t
         return flow_pred.to(original_dtype)
 
+
+    @staticmethod
+    def _prepare_condition_latent_for_model(y, reference: torch.Tensor):
+        """Convert control latents to the underlying Wan model layout.
+
+        The repository-facing wrapper uses ``[B, F, C, H, W]`` latents, while
+        Wan/Wan2.2/Wan2.2Fun transformer implementations concatenate ``x`` and
+        ``y`` after converting ``x`` to per-sample ``[C, F, H, W]``.  Depending
+        on the caller, ``y`` may arrive either in repo layout, model layout, or
+        as a list of per-sample tensors.  Normalize only when the dimensions
+        clearly match the repo layout; leave already model-layout tensors intact.
+        """
+        if y is None:
+            return None
+
+        ref_frames = reference.shape[1]
+        ref_channels = reference.shape[2]
+
+        if isinstance(y, torch.Tensor):
+            if y.ndim != 5:
+                return y
+            # Repo layout: [B, F, C_y, H, W] -> model layout: [B, C_y, F, H, W].
+            # C_y can be larger than the noisy latent channels for Wan2.2Fun
+            # (e.g. control_latents + mask + mask_latents = 100 channels).
+            if y.shape[1] == ref_frames and y.shape[-2:] == reference.shape[-2:]:
+                return y.permute(0, 2, 1, 3, 4).contiguous()
+            # Already model layout: [B, C_y, F, H, W].
+            if y.shape[2] == ref_frames and y.shape[-2:] == reference.shape[-2:]:
+                return y.contiguous()
+            return y
+
+        if isinstance(y, (list, tuple)):
+            prepared = []
+            changed = False
+            for item in y:
+                if isinstance(item, torch.Tensor) and item.ndim == 4:
+                    # Repo per-sample layout: [F, C_y, H, W] -> [C_y, F, H, W].
+                    if item.shape[0] == ref_frames and item.shape[-2:] == reference.shape[-2:]:
+                        prepared.append(item.permute(1, 0, 2, 3).contiguous())
+                        changed = True
+                        continue
+                    if item.shape[1] == ref_frames and item.shape[-2:] == reference.shape[-2:]:
+                        prepared.append(item.contiguous())
+                        changed = True
+                        continue
+                prepared.append(item)
+            return type(y)(prepared) if isinstance(y, tuple) else prepared if changed else y
+
+        return y
+
     def forward(
         self,
         noisy_image_or_video: torch.Tensor, conditional_dict: dict,
@@ -492,6 +597,8 @@ class WanDiffusionWrapper(torch.nn.Module):
         cache_start: Optional[int] = None,
         clip_fea: Optional[torch.Tensor] = None,
         y: Optional[torch.Tensor] = None,
+        y_camera: Optional[torch.Tensor] = None,
+        full_ref: Optional[torch.Tensor] = None,
         wan22_input_timestep: Optional[torch.Tensor] = None,
         mask2: Optional[torch.Tensor] = None,
         wan22_image_latent: Optional[torch.Tensor] = None,
@@ -506,6 +613,10 @@ class WanDiffusionWrapper(torch.nn.Module):
 
         if "2.2" in self.model_name and wan22_input_timestep is not None:
             input_timestep = wan22_input_timestep
+        seq_len = self.get_seq_len(noisy_image_or_video)
+        self.seq_len = seq_len
+
+        y = self._prepare_condition_latent_for_model(y, noisy_image_or_video)
 
         logits = None
         # X0 prediction
@@ -513,13 +624,15 @@ class WanDiffusionWrapper(torch.nn.Module):
             flow_pred = self.model(
                 noisy_image_or_video.permute(0, 2, 1, 3, 4),
                 t=input_timestep, context=prompt_embeds,
-                seq_len=self.seq_len,
+                seq_len=seq_len,
                 kv_cache=kv_cache,
                 crossattn_cache=crossattn_cache,
                 current_start=current_start,
                 cache_start=cache_start,
                 clip_fea=clip_fea,
-                y=y
+                y=y,
+                y_camera=y_camera,
+                full_ref=full_ref
             ).permute(0, 2, 1, 3, 4)
         else:
             if clean_x is not None:
@@ -527,34 +640,40 @@ class WanDiffusionWrapper(torch.nn.Module):
                 flow_pred = self.model(
                     noisy_image_or_video.permute(0, 2, 1, 3, 4),
                     t=input_timestep, context=prompt_embeds,
-                    seq_len=self.seq_len,
+                    seq_len=seq_len,
                     clean_x=clean_x.permute(0, 2, 1, 3, 4),
                     aug_t=aug_t,
                     clip_fea=clip_fea,
-                    y=y
+                    y=y,
+                    y_camera=y_camera,
+                    full_ref=full_ref
                 ).permute(0, 2, 1, 3, 4)
             else:
                 if classify_mode:
                     flow_pred, logits = self.model(
                         noisy_image_or_video.permute(0, 2, 1, 3, 4),
                         t=input_timestep, context=prompt_embeds,
-                        seq_len=self.seq_len,
+                        seq_len=seq_len,
                         classify_mode=True,
                         register_tokens=self._register_tokens,
                         cls_pred_branch=self._cls_pred_branch,
                         gan_ca_blocks=self._gan_ca_blocks,
                         concat_time_embeddings=concat_time_embeddings,
                         clip_fea=clip_fea,
-                        y=y
+                        y=y,
+                        y_camera=y_camera,
+                        full_ref=full_ref
                     )
                     flow_pred = flow_pred.permute(0, 2, 1, 3, 4)
                 else:
                     flow_pred = self.model(
                         noisy_image_or_video.permute(0, 2, 1, 3, 4),
                         t=input_timestep, context=prompt_embeds,
-                        seq_len=self.seq_len,
+                        seq_len=seq_len,
                         clip_fea=clip_fea,
-                        y=y
+                        y=y,
+                        y_camera=y_camera,
+                        full_ref=full_ref
                     ).permute(0, 2, 1, 3, 4)
 
         pred_x0 = self._convert_flow_pred_to_x0(

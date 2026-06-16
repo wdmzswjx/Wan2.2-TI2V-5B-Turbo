@@ -362,7 +362,8 @@ class CausalHead(nn.Module):
         # with amp.autocast(dtype=torch.float32):
         num_frames, frame_seqlen = e.shape[1], x.shape[1] // e.shape[1]
         e = (self.modulation.unsqueeze(1) + e).chunk(2, dim=2)
-        x = (self.head(self.norm(x).unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * (1 + e[1]) + e[0]))
+        head_input = self.norm(x).unflatten(dim=1, sizes=(num_frames, frame_seqlen)) * (1 + e[1]) + e[0]
+        x = self.head(head_input.to(dtype=self.head.weight.dtype))
         return x
 
 
@@ -499,7 +500,11 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         self.num_frame_per_block = 1
         self.independent_first_frame = False
 
-    def _set_gradient_checkpointing(self, module, value=False):
+    def _set_gradient_checkpointing(
+        self, module=None, value=False, enable=None, gradient_checkpointing_func=None
+    ):
+        if enable is not None:
+            value = enable
         self.gradient_checkpointing = value
 
     @staticmethod
@@ -717,6 +722,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         seq_len,
         clip_fea=None,
         y=None,
+        y_camera=None,
+        full_ref=None,
         kv_cache: dict = None,
         crossattn_cache: dict = None,
         current_start: int = 0,
@@ -850,6 +857,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         aug_t=None,
         clip_fea=None,
         y=None,
+        y_camera=None,
+        full_ref=None,
     ):
         r"""
         Forward pass through the diffusion model

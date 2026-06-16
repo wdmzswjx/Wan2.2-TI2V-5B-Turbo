@@ -1,8 +1,16 @@
 import gc
 import logging
 
-from utils.dataset import ShardingLMDBDataset, cycle
-from utils.dataset import TextDataset, TextFolderDataset
+from utils.dataset import (
+    ODERegressionCSVDataset,
+    ImageVideoControlDataset,
+    ImageVideoSampler,
+    AspectRatioBatchImageVideoSampler,
+    cycle,
+    OffsetDistributedSampler,
+    wan22fun_collate_fn,
+    wan22fun_worker_init_fn,
+)
 from utils.distributed import EMA_FSDP, fsdp_wrap, fsdp_state_dict, launch_distributed_job
 from utils.misc import (
     set_seed,
@@ -12,9 +20,82 @@ import torch.distributed as dist
 from omegaconf import OmegaConf
 from model import CausVid, DMD, SiD, Wan22FunDMD
 import torch
+import torch.nn.functional as F
 import wandb
 import time
 import os
+import re
+import shutil
+from collections import OrderedDict
+
+from safetensors.torch import save_file
+
+
+def _strip_checkpoint_wrapper_prefix(name):
+    """Remove wrappers added by FSDP/checkpointing before matching state keys."""
+    for prefix in ("_fsdp_wrapped_module.", "_checkpoint_wrapped_module.", "_orig_mod."):
+        name = name.replace(prefix, "")
+    return name
+
+
+def extract_generator_state_dict(
+    checkpoint,
+    use_ema=False,
+    transformer_only=True,
+):
+    """Extract generator weights from a Wan2.2Fun training checkpoint.
+
+    Args:
+        checkpoint: A checkpoint path or an already-loaded checkpoint dict.
+        use_ema: Extract ``generator_ema`` instead of ``generator`` when present.
+        transformer_only: Strip the WanDiffusionWrapper ``model.`` prefix so the
+            returned state dict can be loaded directly by the transformer model
+            (for example ``Wan22FunModel`` / ``Wan2_2Transformer3DModel``).
+
+    Returns:
+        An ``OrderedDict`` containing only the requested generator weights.
+    """
+    if isinstance(checkpoint, (str, os.PathLike)):
+        checkpoint = torch.load(checkpoint, map_location="cpu")
+
+    key = "generator_ema" if use_ema and "generator_ema" in checkpoint else "generator"
+    if key in checkpoint:
+        state_dict = checkpoint[key]
+    elif "model" in checkpoint:
+        state_dict = checkpoint["model"]
+    else:
+        state_dict = checkpoint
+
+    extracted = OrderedDict()
+    for name, tensor in state_dict.items():
+        clean_name = _strip_checkpoint_wrapper_prefix(name)
+        if transformer_only:
+            if not clean_name.startswith("model."):
+                continue
+            clean_name = clean_name[len("model."):]
+        extracted[clean_name] = tensor.detach().cpu() if torch.is_tensor(tensor) else tensor
+    return extracted
+
+
+def save_generator_for_transformer(
+    checkpoint_path,
+    output_path,
+    use_ema=False,
+    transformer_only=True,
+):
+    """Save generator weights in a format loadable by the raw transformer model."""
+    state_dict = extract_generator_state_dict(
+        checkpoint_path,
+        use_ema=use_ema,
+        transformer_only=transformer_only,
+    )
+    output_path = os.fspath(output_path)
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    if output_path.endswith(".safetensors"):
+        save_file(state_dict, output_path)
+    else:
+        torch.save(state_dict, output_path)
+    return output_path, len(state_dict)
 
 
 class Trainer:
@@ -57,17 +138,19 @@ class Trainer:
 
         self.output_path = config.logdir
 
-        # Step 2: Initialize the model and optimizer
-        if config.distribution_loss == "causvid":
-            self.model = CausVid(config, device=self.device)
-        elif config.distribution_loss == "dmd":
-            self.model = DMD(config, device=self.device)
-        elif config.distribution_loss == "sid":
-            self.model = SiD(config, device=self.device)
-        elif config.distribution_loss in ("wan22fun", "wan22fun_dmd"):
-            self.model = Wan22FunDMD(config, device=self.device)
-        else:
-            raise ValueError("Invalid distribution matching loss")
+        # Step 2: Initialize the Wan2.2Fun model and optimizer
+        if config.distribution_loss not in ("wan22fun", "wan22fun_dmd"):
+            raise ValueError("Wan22FunScoreDistillationTrainer requires distribution_loss='wan22fun'")
+        self.model = Wan22FunDMD(config, device=self.device)
+
+        # Resume Training from Latest Checkpoint
+        pretrained_ckpt_path, self.step = self.load(self.output_path)
+        if pretrained_ckpt_path is not None:
+            if self.is_main_process:
+                print(f"Loading checkpoint from {pretrained_ckpt_path} at step {self.step}")
+            state_dict = torch.load(pretrained_ckpt_path, map_location="cpu")
+            self.model.generator.load_state_dict(state_dict["generator"], strict=True)
+            self.model.fake_score.load_state_dict(state_dict["critic"], strict=True)
 
         # Save pretrained model state_dicts to CPU
         self.fake_score_state_dict_cpu = self.model.fake_score.state_dict()
@@ -101,21 +184,8 @@ class Trainer:
             cpu_offload=getattr(config, "text_encoder_cpu_offload", False)
         )
 
-        if self.config.i2v:
-            self.model.image_encoder = fsdp_wrap(
-                self.model.image_encoder,
-                sharding_strategy=config.sharding_strategy,
-                mixed_precision=config.mixed_precision,
-                wrap_strategy=config.image_encoder_fsdp_wrap_strategy,
-                min_num_params=int(5e6),
-                cpu_offload=getattr(config, "image_encoder_cpu_offload", False)
-            )
-            self.model.vae = self.model.vae.to(
-                device=self.device, dtype=torch.bfloat16)
-
-        elif not config.no_visualize or config.load_raw_video:
-            self.model.vae = self.model.vae.to(
-                device=self.device, dtype=torch.bfloat16 if config.mixed_precision else torch.float32)
+        self.model.vae = self.model.vae.to(
+            device=self.device, dtype=torch.bfloat16 if config.mixed_precision else torch.float32)
 
         self.generator_optimizer = torch.optim.AdamW(
             [param for param in self.model.generator.parameters()
@@ -134,23 +204,78 @@ class Trainer:
         )
 
         # Step 3: Initialize the dataloader
-        if self.config.i2v:
-            dataset = ShardingLMDBDataset(config.data_path, max_pair=int(1e8))
-        else:
-            if self.config.data_type == "text_folder":
-                dataset = TextFolderDataset(config.data_path)
-            elif self.config.data_type == "text_file":
-                dataset = TextDataset(config.data_path)
+        if getattr(config, "use_wan22fun_dataloader", False):
+            train_data_meta = config.data_path or getattr(config, "train_data_meta", None)
+            if train_data_meta is None:
+                raise ValueError("Wan2.2Fun dataloader requires --data_path or train_data_meta")
+            dataset = ImageVideoControlDataset(
+                train_data_meta,
+                getattr(config, "train_data_dir", None),
+                video_sample_size=getattr(config, "video_sample_size", 704),
+                video_sample_stride=getattr(config, "video_sample_stride", 1),
+                video_sample_n_frames=getattr(config, "video_sample_n_frames", 121),
+                video_repeat=getattr(config, "video_repeat", 1),
+                image_sample_size=getattr(config, "image_sample_size", getattr(config, "video_sample_size", 704)),
+                text_drop_ratio=getattr(config, "text_drop_ratio", 0.1),
+                enable_bucket=getattr(config, "enable_bucket", True),
+                video_length_drop_start=getattr(config, "video_length_drop_start", 0.1),
+                video_length_drop_end=getattr(config, "video_length_drop_end", 0.9),
+                enable_inpaint=getattr(config, "add_inpaint_info", False),
+                enable_camera_info=getattr(config, "train_mode", "control_ref") == "control_camera_ref",
+                enable_subject_info=getattr(config, "enable_subject_info", False),
+            )
+            sampler = torch.utils.data.distributed.DistributedSampler(
+                dataset,
+                num_replicas=self.world_size,
+                rank=global_rank,
+                shuffle=True,
+                seed=config.seed,
+                drop_last=True,
+            )
+            if getattr(config, "enable_bucket", True):
+                batch_sampler = AspectRatioBatchImageVideoSampler(
+                    sampler,
+                    dataset.dataset,
+                    batch_size=config.batch_size,
+                    train_folder=getattr(config, "train_data_dir", None),
+                    drop_last=True,
+                )
             else:
-                raise ValueError("Invalid data type")
-            
-        sampler = torch.utils.data.distributed.DistributedSampler(
-            dataset, shuffle=True, drop_last=True)
-        dataloader = torch.utils.data.DataLoader(
-            dataset,
-            batch_size=config.batch_size,
-            sampler=sampler,
-            num_workers=8)
+                batch_sampler = ImageVideoSampler(
+                    sampler,
+                    dataset,
+                    batch_size=config.batch_size,
+                    drop_last=True,
+                )
+            dataloader = torch.utils.data.DataLoader(
+                dataset,
+                batch_sampler=batch_sampler,
+                collate_fn=wan22fun_collate_fn(config),
+                persistent_workers=getattr(config, "dataloader_num_workers", 8) != 0,
+                num_workers=getattr(config, "dataloader_num_workers", 8),
+                worker_init_fn=wan22fun_worker_init_fn(config.seed + global_rank),
+            )
+        else:
+            dataset = ODERegressionCSVDataset(
+                config.data_path, 
+                max_pair=int(1e8), 
+                num_frames=getattr(config, "video_sample_n_frames", 121),
+                h=getattr(config, "video_sample_size", 704),
+                w=getattr(config, "video_sample_size", 704),
+            )
+                
+            sampler = OffsetDistributedSampler(
+                dataset,
+                initial_step=self.step,
+                gpu_num=self.world_size,
+                shuffle=False,
+                drop_last=True,
+            )
+            dataloader = torch.utils.data.DataLoader(
+                dataset,
+                batch_size=config.batch_size,
+                sampler=sampler,
+                num_workers=8)
 
         if dist.get_rank() == 0:
             print("DATASET SIZE %d" % len(dataset))
@@ -176,6 +301,15 @@ class Trainer:
         if (self.ema_weight > 0.0) and (self.step >= self.ema_start_step):
             print(f"Setting up EMA with weight {self.ema_weight}")
             self.generator_ema = EMA_FSDP(self.model.generator, decay=self.ema_weight)
+            
+            # Load EMA state dict if available in checkpoint
+            if pretrained_ckpt_path is not None:
+                checkpoint_state_dict = torch.load(pretrained_ckpt_path, map_location="cpu")
+                if "generator_ema" in checkpoint_state_dict:
+                    print("Loading generator_ema from checkpoint")
+                    self.generator_ema.load_state_dict(checkpoint_state_dict["generator_ema"])
+                else:
+                    print("No generator_ema found in checkpoint, starting fresh EMA")
 
         ##############################################################################################################
         # 7. (If resuming) Load the model and optimizer, lr_scheduler, ema's statedicts
@@ -200,6 +334,42 @@ class Trainer:
         self.max_grad_norm_critic = getattr(config, "max_grad_norm_critic", 10.0)
         self.previous_time = None
 
+    @staticmethod
+    def _checkpoint_step(folder_name):
+        match = re.fullmatch(r"checkpoint_model_(\d+)", folder_name)
+        return int(match.group(1)) if match else -1
+
+    def _prune_old_checkpoints(self, keep_last=5):
+        if keep_last is None or keep_last <= 0 or not os.path.exists(self.output_path):
+            return
+        checkpoints = []
+        for folder_name in os.listdir(self.output_path):
+            step = self._checkpoint_step(folder_name)
+            path = os.path.join(self.output_path, folder_name)
+            if step >= 0 and os.path.isdir(path):
+                checkpoints.append((step, path))
+        checkpoints.sort(key=lambda item: item[0])
+        for _, path in checkpoints[:-keep_last]:
+            shutil.rmtree(path, ignore_errors=True)
+            print(f"Removed old checkpoint {path}")
+
+    def load(self, out_path):
+        # 1. 找到最新的checkpoint文件夹（按步数排序）
+        if not os.path.exists(out_path):
+            return None, 0
+        ckpt_folders = [f for f in os.listdir(out_path) if self._checkpoint_step(f) >= 0]
+        if not ckpt_folders:
+            return None, 0
+        ckpt_folders.sort(key=self._checkpoint_step)
+        latest_ckpt_folder = ckpt_folders[-1]
+
+        # 2. 读取model.pt和步数
+        model_path = os.path.join(out_path, latest_ckpt_folder, "model.pt")
+        step = self._checkpoint_step(latest_ckpt_folder)
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"{model_path} not found")
+        return model_path, step
+    
     def save(self):
         print("Start gathering distributed model states...")
         generator_state_dict = fsdp_state_dict(
@@ -226,6 +396,29 @@ class Trainer:
                        f"checkpoint_model_{self.step:06d}", "model.pt"))
             print("Model saved to", os.path.join(self.output_path,
                   f"checkpoint_model_{self.step:06d}", "model.pt"))
+            self._prune_old_checkpoints(
+                keep_last=getattr(self.config, "max_checkpoints_to_keep", 5)
+            )
+
+
+    @staticmethod
+    def _build_wan22fun_mask_latents(mask, latents):
+        """Convert pixel-space masks [B,F,1,H,W] to latent mask tokens [B,F,4,h,w]."""
+        mask = mask.permute(0, 2, 1, 3, 4).contiguous()
+        mask = torch.cat([torch.repeat_interleave(mask[:, :, 0:1], repeats=4, dim=2), mask[:, :, 1:]], dim=2)
+        batch, _, frames4, height, width = mask.shape
+        mask = mask.view(batch, frames4 // 4, 4, height, width).transpose(1, 2).contiguous()
+        mask = F.interpolate(mask, size=latents.shape[1:2] + latents.shape[-2:], mode="trilinear", align_corners=True)
+        return mask.permute(0, 2, 1, 3, 4).contiguous().to(device=latents.device, dtype=latents.dtype)
+
+    @staticmethod
+    def _apply_t2v_inpaint_dropout(mask, inpaint_latents):
+        """Mirror Wan2.2Fun's t2v dropout while preserving inpaint channel count."""
+        is_all_mask = mask.reshape(mask.shape[0], -1).bool().all(dim=1)
+        keep = torch.ones(mask.shape[0], device=inpaint_latents.device, dtype=inpaint_latents.dtype)
+        random_drop = torch.rand(mask.shape[0], device=inpaint_latents.device) < 0.90
+        keep = torch.where(is_all_mask.to(inpaint_latents.device) & random_drop, torch.zeros_like(keep), keep)
+        return keep[:, None, None, None, None] * inpaint_latents
 
     def fwdbwd_one_step(self, batch, train_generator):
         self.model.eval()  # prevent any randomness (e.g. dropout)
@@ -234,17 +427,67 @@ class Trainer:
             torch.cuda.empty_cache()
 
         # Step 1: Get the next batch of text prompts
-        text_prompts = batch["prompts"]
-        if self.config.i2v:
-            clean_latent = None
-            image_latent = batch["ode_latent"][:, -1][:, 0:1, ].to(
-                device=self.device, dtype=self.dtype)
+        text_prompts = batch.get("prompts", batch.get("text"))
+        if "video" in batch:
+            video_tensor = batch["video"].to(device=self.device, dtype=self.dtype)
         else:
-            clean_latent = None
-            image_latent = None
+            video_tensor = batch["pixel_values"].permute(0, 2, 1, 3, 4).contiguous().to(device=self.device, dtype=self.dtype)
+        first_frame = video_tensor[:, :, :1, :, :]
+        # Fallback only: Wan2.2Fun's real image-token injection latent is
+        # overwritten below from the tail VAE-latent block carried by y.
+        wan22_image_latent = self.model.vae.encode_to_latent(first_frame)
+
+        control_latents = None
+        denoise_latent_shape = None
+        full_ref = None
+        y_camera = None
+        with torch.no_grad():
+            if "control_pixel_values" in batch:
+                control_video_tensor = batch["control_pixel_values"].permute(0, 2, 1, 3, 4).contiguous().to(
+                    device=self.device, dtype=self.dtype
+                )
+                control_latents = self.model.vae.encode_to_latent(control_video_tensor).to(self.dtype)
+                denoise_latent_shape = list(control_latents.shape)
+
+                if "mask" in batch and "mask_pixel_values" in batch:
+                    mask = batch["mask"].to(device=self.device, dtype=self.dtype)
+                    mask_pixel_tensor = batch["mask_pixel_values"].permute(0, 2, 1, 3, 4).contiguous().to(
+                        device=self.device, dtype=self.dtype
+                    )
+                    mask_latents = self.model.vae.encode_to_latent(mask_pixel_tensor).to(self.dtype)
+                    mask_latent_tokens = self._build_wan22fun_mask_latents(mask, mask_latents)
+                    inpaint_latents = torch.cat([mask_latent_tokens, mask_latents], dim=2)
+                    inpaint_latents = self._apply_t2v_inpaint_dropout(mask, inpaint_latents)
+                    control_latents = torch.cat([control_latents, inpaint_latents], dim=2)
+
+                # Wan2.2Fun image-token injection should follow the reliable
+                # latent condition carried by y.  In the upstream control format
+                # the final VAE-latent block is the image/reference signal used
+                # for the first-frame token injection.
+                if control_latents.shape[2] >= 48:
+                    wan22_image_latent = control_latents[:, :1, -48:].contiguous()
+
+            if "ref_pixel_values" in batch:
+                ref_video_tensor = batch["ref_pixel_values"].permute(0, 2, 1, 3, 4).contiguous().to(
+                    device=self.device, dtype=self.dtype
+                )
+                ref_latents = self.model.vae.encode_to_latent(ref_video_tensor).to(self.dtype)
+                full_ref = ref_latents[:, 0].clone()
+            else:
+                full_ref = wan22_image_latent[:, 0].clone()
+
+        clean_latent = None
+        image_latent = None
 
         batch_size = len(text_prompts)
-        image_or_video_shape = list(self.config.image_or_video_shape)
+        if denoise_latent_shape is not None:
+            image_or_video_shape = denoise_latent_shape
+        else:
+            image_or_video_shape = [
+                batch_size,
+                wan22_image_latent.shape[1],
+                *list(wan22_image_latent.shape[2:]),
+            ]
         image_or_video_shape[0] = batch_size
 
         # Step 2: Extract the conditional infos
@@ -267,7 +510,7 @@ class Trainer:
                 y = self.model.vae.run_vae_encoder(img)
             else:
                 clip_fea = None
-                y = None
+                y = control_latents
 
         # Step 3: Store gradients for the generator (if training the generator)
         if train_generator:
@@ -278,7 +521,10 @@ class Trainer:
                 clean_latent=clean_latent,
                 initial_latent=image_latent if self.config.i2v else None,
                 clip_fea=clip_fea,
-                y=y
+                y=y,
+                y_camera=y_camera,
+                full_ref=full_ref,
+                wan22_image_latent=wan22_image_latent,
             )
 
             torch.cuda.empty_cache()
@@ -302,7 +548,10 @@ class Trainer:
             clean_latent=clean_latent,
             initial_latent=image_latent if self.config.i2v else None,
             clip_fea=clip_fea,
-            y=y
+            y=y,
+            y_camera=y_camera,
+            full_ref=full_ref,
+            wan22_image_latent=wan22_image_latent,
         )
 
         critic_loss.backward()
@@ -360,9 +609,10 @@ class Trainer:
                 extra = self.fwdbwd_one_step(batch, True)
                 extras_list.append(extra)
                 generator_log_dict = merge_dict_list(extras_list)
-                self.generator_optimizer.step()
-                if self.generator_ema is not None:
-                    self.generator_ema.update(self.model.generator)
+                if not self.config.debug:
+                    self.generator_optimizer.step()
+                    if self.generator_ema is not None:
+                        self.generator_ema.update(self.model.generator)
 
             # Train the critic
             self.critic_optimizer.zero_grad(set_to_none=True)
@@ -371,7 +621,8 @@ class Trainer:
             extra = self.fwdbwd_one_step(batch, False)
             extras_list.append(extra)
             critic_log_dict = merge_dict_list(extras_list)
-            self.critic_optimizer.step()
+            if not self.config.debug:
+                self.critic_optimizer.step()
 
             # Increment the step since we finished gradient update
             self.step += 1

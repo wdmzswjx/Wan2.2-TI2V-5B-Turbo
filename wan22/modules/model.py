@@ -298,9 +298,8 @@ class Head(nn.Module):
         # assert e.dtype == torch.float32
         # with torch.amp.autocast('cuda', dtype=torch.float32):
         e = (self.modulation.unsqueeze(0) + e.unsqueeze(2)).chunk(2, dim=2)
-        x = (
-            self.head(
-                self.norm(x) * (1 + e[1].squeeze(2)) + e[0].squeeze(2)))
+        head_input = self.norm(x) * (1 + e[1].squeeze(2)) + e[0].squeeze(2)
+        x = self.head(head_input.to(dtype=self.head.weight.dtype))
         return x
 
 
@@ -421,7 +420,13 @@ class Wan22Model(ModelMixin, ConfigMixin):
         # initialize weights
         self.init_weights()
 
-    def _set_gradient_checkpointing(self, module, value=False):
+        self.gradient_checkpointing = False
+
+    def _set_gradient_checkpointing(
+        self, module=None, value=False, enable=None, gradient_checkpointing_func=None
+    ):
+        if enable is not None:
+            value = enable
         self.gradient_checkpointing = value
 
     def forward(
@@ -444,6 +449,8 @@ class Wan22Model(ModelMixin, ConfigMixin):
         gan_ca_blocks=None,
         clip_fea=None,
         y=None,
+        y_camera=None,
+        full_ref=None,
     ):
         r"""
         Forward pass through the diffusion model

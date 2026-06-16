@@ -462,7 +462,8 @@ class Head(nn.Module):
         # assert e.dtype == torch.float32
         # with amp.autocast(dtype=torch.float32):
         e = (self.modulation + e.unsqueeze(1)).chunk(2, dim=1)
-        x = (self.head(self.norm(x) * (1 + e[1]) + e[0]))
+        head_input = self.norm(x) * (1 + e[1]) + e[0]
+        x = self.head(head_input.to(dtype=self.head.weight.dtype))
         return x
 
 
@@ -620,7 +621,11 @@ class WanModel(ModelMixin, ConfigMixin):
 
         self.gradient_checkpointing = False
 
-    def _set_gradient_checkpointing(self, module, value=False):
+    def _set_gradient_checkpointing(
+        self, module=None, value=False, enable=None, gradient_checkpointing_func=None
+    ):
+        if enable is not None:
+            value = enable
         self.gradient_checkpointing = value
 
     def forward(
@@ -647,6 +652,8 @@ class WanModel(ModelMixin, ConfigMixin):
         gan_ca_blocks=None,
         clip_fea=None,
         y=None,
+        y_camera=None,
+        full_ref=None,
     ):
         r"""
         Forward pass through the diffusion model
@@ -780,6 +787,8 @@ class WanModel(ModelMixin, ConfigMixin):
         cls_pred_branch,
         clip_fea=None,
         y=None,
+        y_camera=None,
+        full_ref=None,
     ):
         r"""
         Feature extraction through the diffusion model

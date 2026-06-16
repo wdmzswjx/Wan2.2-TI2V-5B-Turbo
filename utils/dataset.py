@@ -1,11 +1,13 @@
 from utils.lmdb import get_array_shape_from_lmdb, retrieve_row_from_lmdb
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, RandomSampler
 import numpy as np
 import torch
 import lmdb
 import json
+import csv
 from PIL import Image
 import os
+import torchvision.transforms as transforms
 import torchvision.transforms.functional as TF
 import pandas as pd
 import cv2
@@ -13,7 +15,118 @@ import random
 from pathlib import Path
 import decord
 from torchvision.transforms.functional import resize
+import torch.nn.functional as F
 from torch.utils.data.distributed import DistributedSampler
+
+SAMPLE_N_FRAMES_BUCKET_INTERVAL = 4
+SPATIAL_COMPRESSION_RATIO = 16
+ASPECT_RATIO_512 = {
+    "1:1": [512, 512],
+    "4:3": [512, 672],
+    "3:4": [672, 512],
+    "16:9": [512, 912],
+    "9:16": [912, 512],
+    "21:9": [512, 1192],
+    "9:21": [1192, 512],
+}
+ASPECT_RATIO_RANDOM_CROP_512 = ASPECT_RATIO_512
+ASPECT_RATIO_RANDOM_CROP_PROB = np.ones(len(ASPECT_RATIO_RANDOM_CROP_512)) / len(ASPECT_RATIO_RANDOM_CROP_512)
+
+
+
+def get_random_mask(shape, image_start_only=False):
+    """Generate Wan2.2Fun-style random inpaint masks.
+
+    Args:
+        shape: Video tensor shape ``[F, C, H, W]``.
+        image_start_only: If true, keep only the first frame unmasked for video.
+
+    Returns:
+        A mask tensor with shape ``[F, 1, H, W]`` where 1 means masked.
+    """
+    f, _, h, w = shape
+    mask = torch.zeros((f, 1, h, w), dtype=torch.uint8)
+
+    if image_start_only:
+        if f != 1:
+            mask[1:, :, :, :] = 1
+        else:
+            mask[:, :, :, :] = 1
+        return mask
+
+    if f != 1:
+        mask_index = np.random.choice(
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+            p=[0.05, 0.2, 0.2, 0.2, 0.05, 0.05, 0.05, 0.1, 0.05, 0.05],
+        )
+    else:
+        mask_index = np.random.choice([0, 1], p=[0.2, 0.8])
+
+    if mask_index == 0:
+        center_x = torch.randint(0, w, (1,)).item()
+        center_y = torch.randint(0, h, (1,)).item()
+        block_size_x = torch.randint(max(w // 4, 1), max(w // 4 * 3, 2), (1,)).item()
+        block_size_y = torch.randint(max(h // 4, 1), max(h // 4 * 3, 2), (1,)).item()
+        start_x = max(center_x - block_size_x // 2, 0)
+        end_x = min(center_x + block_size_x // 2, w)
+        start_y = max(center_y - block_size_y // 2, 0)
+        end_y = min(center_y + block_size_y // 2, h)
+        mask[:, :, start_y:end_y, start_x:end_x] = 1
+    elif mask_index == 1:
+        mask[:, :, :, :] = 1
+    elif mask_index == 2:
+        mask_frame_index = np.random.randint(1, 5)
+        mask[mask_frame_index:, :, :, :] = 1
+    elif mask_index == 3:
+        mask_frame_index = np.random.randint(1, 5)
+        mask[mask_frame_index:-mask_frame_index, :, :, :] = 1
+    elif mask_index == 4:
+        center_x = torch.randint(0, w, (1,)).item()
+        center_y = torch.randint(0, h, (1,)).item()
+        block_size_x = torch.randint(max(w // 4, 1), max(w // 4 * 3, 2), (1,)).item()
+        block_size_y = torch.randint(max(h // 4, 1), max(h // 4 * 3, 2), (1,)).item()
+        start_x = max(center_x - block_size_x // 2, 0)
+        end_x = min(center_x + block_size_x // 2, w)
+        start_y = max(center_y - block_size_y // 2, 0)
+        end_y = min(center_y + block_size_y // 2, h)
+        mask_frame_before = np.random.randint(0, max(f // 2, 1))
+        mask_frame_after = np.random.randint(max(f // 2, 1), f) if f > 1 else 1
+        mask[mask_frame_before:mask_frame_after, :, start_y:end_y, start_x:end_x] = 1
+    elif mask_index == 5:
+        mask = torch.randint(0, 2, (f, 1, h, w), dtype=torch.uint8)
+    elif mask_index == 6:
+        num_frames_to_mask = random.randint(1, max(f // 2, 1))
+        frames_to_mask = random.sample(range(f), num_frames_to_mask)
+        for frame_idx in frames_to_mask:
+            block_height = random.randint(1, max(h // 4, 1))
+            block_width = random.randint(1, max(w // 4, 1))
+            top_left_y = random.randint(0, max(h - block_height, 0))
+            top_left_x = random.randint(0, max(w - block_width, 0))
+            mask[frame_idx, 0, top_left_y:top_left_y + block_height, top_left_x:top_left_x + block_width] = 1
+    elif mask_index == 7:
+        center_x = torch.randint(0, w, (1,)).item()
+        center_y = torch.randint(0, h, (1,)).item()
+        a = torch.randint(max(min(w, h) // 8, 1), max(min(w, h) // 4, 2), (1,)).item()
+        b = torch.randint(max(min(h, w) // 8, 1), max(min(h, w) // 4, 2), (1,)).item()
+        for yi in range(h):
+            for xi in range(w):
+                if ((yi - center_y) ** 2) / (b ** 2) + ((xi - center_x) ** 2) / (a ** 2) < 1:
+                    mask[:, :, yi, xi] = 1
+    elif mask_index == 8:
+        center_x = torch.randint(0, w, (1,)).item()
+        center_y = torch.randint(0, h, (1,)).item()
+        radius = torch.randint(max(min(h, w) // 8, 1), max(min(h, w) // 4, 2), (1,)).item()
+        for yi in range(h):
+            for xi in range(w):
+                if (yi - center_y) ** 2 + (xi - center_x) ** 2 < radius ** 2:
+                    mask[:, :, yi, xi] = 1
+    elif mask_index == 9:
+        for frame_idx in range(f):
+            if np.random.rand() > 0.5:
+                mask[frame_idx, :, :, :] = 1
+    else:
+        raise ValueError(f"The mask_index {mask_index} is not defined")
+    return mask
 
 class OffsetDistributedSampler(DistributedSampler):
     def __init__(self, dataset, initial_step=0, gpu_num=4, **kwargs):
@@ -268,12 +381,515 @@ class TextImagePairDataset(Dataset):
         }
 
 
+class ImageVideoControlDataset(Dataset):
+    """Wan2.2Fun-style image/video dataset with optional control frames.
+
+    The metadata file can be CSV or JSON/JSONL and should contain at least a
+    text/caption column plus a video/image path column. Supported aliases:
+    ``text``/``caption``/``prompt`` for prompts, ``path``/``video_path``/``file``
+    for target pixels, and ``control_path``/``control_video_path`` for control
+    pixels.  If no control path is provided, target pixels are reused as control
+    pixels, matching the common first-frame/control-ref bootstrap workflow.
+    """
+
+    def __init__(
+        self,
+        train_data_meta,
+        train_data_dir=None,
+        video_sample_size=704,
+        video_sample_stride=1,
+        video_sample_n_frames=121,
+        video_repeat=1,
+        image_sample_size=None,
+        text_drop_ratio=0.1,
+        enable_bucket=True,
+        video_length_drop_start=0.1,
+        video_length_drop_end=0.9,
+        enable_inpaint=False,
+        enable_camera_info=False,
+        return_file_name=False,
+        enable_subject_info=False,
+    ):
+        self.meta_path = Path(train_data_meta)
+        self.train_data_dir = Path(train_data_dir) if train_data_dir else self.meta_path.parent
+        self.video_sample_size = tuple(video_sample_size) if not isinstance(video_sample_size, int) else (video_sample_size, video_sample_size)
+        self.video_sample_stride = max(int(video_sample_stride), 1)
+        self.video_sample_n_frames = int(video_sample_n_frames)
+        self.video_repeat = int(video_repeat)
+        self.image_sample_size = tuple(image_sample_size or video_sample_size) if not isinstance(image_sample_size or video_sample_size, int) else (image_sample_size or video_sample_size, image_sample_size or video_sample_size)
+        self.enable_bucket = enable_bucket
+        self.text_drop_ratio = text_drop_ratio
+        self.video_length_drop_start = video_length_drop_start
+        self.video_length_drop_end = video_length_drop_end
+        self.enable_inpaint = enable_inpaint
+        self.enable_camera_info = enable_camera_info
+        self.return_file_name = return_file_name
+        self.enable_subject_info = enable_subject_info
+        self.larger_side_of_image_and_video = max(min(self.image_sample_size), min(self.video_sample_size))
+        raw_dataset = self._load_metadata(self.meta_path)
+        if self.video_repeat > 0:
+            self.dataset = [data for data in raw_dataset if data.get("type", "image") != "video"]
+            for _ in range(self.video_repeat):
+                self.dataset.extend([data for data in raw_dataset if data.get("type", "image") == "video"])
+        else:
+            self.dataset = raw_dataset
+        self.length = len(self.dataset)
+        self.video_transforms = transforms.Compose([
+            transforms.Resize(min(self.video_sample_size)),
+            transforms.CenterCrop(self.video_sample_size),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True),
+        ])
+        self.image_transforms = transforms.Compose([
+            transforms.Resize(min(self.image_sample_size)),
+            transforms.CenterCrop(self.image_sample_size),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
+        ])
+
+    def _load_metadata(self, meta_path):
+        suffix = meta_path.suffix.lower()
+        if suffix == ".csv":
+            with open(meta_path, encoding="utf-8") as csvfile:
+                rows = list(csv.DictReader(csvfile))
+        elif suffix == ".jsonl":
+            with open(meta_path, encoding="utf-8") as f:
+                rows = [json.loads(line) for line in f if line.strip()]
+        else:
+            with open(meta_path, encoding="utf-8") as f:
+                data = json.load(f)
+            rows = data if isinstance(data, list) else data.get("data", [])
+        if not rows:
+            raise ValueError(f"No training samples found in {meta_path}")
+        return rows
+
+    def __len__(self):
+        return self.length
+
+    def _get_value(self, item, names, default=""):
+        for name in names:
+            if name in item and item[name] != "":
+                return item[name]
+        return default
+
+    def _resolve_path(self, path):
+        path = Path(str(path))
+        if path.is_absolute() or path.exists():
+            return path
+        candidate = self.train_data_dir / path
+        if candidate.exists():
+            return candidate
+        return self.meta_path.parent / path
+
+    def _resize_frames_to_larger_side(self, frames):
+        resized_frames = []
+        for frame in frames:
+            height, width = frame.shape[:2]
+            if min(height, width) == self.larger_side_of_image_and_video:
+                resized_frames.append(frame)
+                continue
+            if height < width:
+                new_height = self.larger_side_of_image_and_video
+                new_width = int(width * new_height / max(height, 1))
+            else:
+                new_width = self.larger_side_of_image_and_video
+                new_height = int(height * new_width / max(width, 1))
+            resized_frames.append(cv2.resize(frame, (new_width, new_height), interpolation=cv2.INTER_LINEAR))
+        return np.array(resized_frames)
+
+    def _read_frames(self, path, frame_indices=None):
+        path = self._resolve_path(path)
+        if path.is_dir():
+            image_files = sorted(
+                [p for p in path.iterdir() if p.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp", ".webp"}]
+            )
+            if not image_files:
+                raise ValueError(f"No image frames found in {path}")
+            if frame_indices is not None:
+                image_files = [image_files[min(int(index), len(image_files) - 1)] for index in frame_indices]
+            frames = [cv2.cvtColor(cv2.imread(str(p), cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB) for p in image_files]
+        elif path.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp", ".webp"}:
+            frame = cv2.cvtColor(cv2.imread(str(path), cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB)
+            frames = [frame]
+        else:
+            reader = decord.VideoReader(uri=path.as_posix())
+            if frame_indices is None:
+                min_sample_n_frames = min(
+                    self.video_sample_n_frames,
+                    int(len(reader) * (self.video_length_drop_end - self.video_length_drop_start) // self.video_sample_stride),
+                )
+                if min_sample_n_frames == 0:
+                    raise ValueError(f"No frames in video: {path}")
+                video_length = int(self.video_length_drop_end * len(reader))
+                clip_length = min(video_length, (min_sample_n_frames - 1) * self.video_sample_stride + 1)
+                start_min = int(self.video_length_drop_start * video_length)
+                start_max = max(video_length - clip_length, start_min)
+                start_idx = random.randint(start_min, start_max) if video_length != clip_length else 0
+                frame_indices = np.linspace(start_idx, start_idx + clip_length - 1, min_sample_n_frames, dtype=int)
+            if len(frame_indices) == 0:
+                raise ValueError(f"Video has no frames: {path}")
+            frame_indices = [min(int(index), len(reader) - 1) for index in frame_indices]
+            frames = reader.get_batch(frame_indices).asnumpy()
+            return self._resize_frames_to_larger_side(frames), np.array(frame_indices, dtype=int)
+        frames = self._resize_frames_to_larger_side(np.stack(frames, axis=0))
+        return frames, np.arange(frames.shape[0], dtype=int)
+
+    def _to_non_bucket_video(self, frames, sample_size):
+        tensor = torch.from_numpy(frames).permute(0, 3, 1, 2).contiguous().float() / 255.0
+        return _resize_crop_normalize_video(tensor, sample_size, normalize=True)
+
+    def get_batch(self, idx):
+        data_info = self.dataset[idx % len(self.dataset)]
+        data_type = data_info.get("type", "image")
+        text = self._get_value(data_info, ["text", "caption", "prompt"])
+        if random.random() < self.text_drop_ratio:
+            text = ""
+        pixel_path = self._get_value(data_info, ["file_path", "path", "video_path", "image_path", "file"])
+        control_path = self._get_value(data_info, ["control_file_path", "control_path", "control_video_path", "control_image_path"], "")
+        if pixel_path == "":
+            raise ValueError(f"Sample {idx} is missing file_path/path: {data_info}")
+
+        if data_type == "video":
+            pixel_values, frame_indices = self._read_frames(pixel_path)
+            if not self.enable_bucket:
+                pixel_values = self._to_non_bucket_video(pixel_values, self.video_sample_size)
+
+            control_camera_values = None
+            if self.enable_camera_info and control_path.lower().endswith(".txt"):
+                control_pixel_values = np.zeros_like(pixel_values) if self.enable_bucket else torch.zeros_like(pixel_values)
+            elif control_path:
+                control_pixel_values, _ = self._read_frames(control_path, frame_indices)
+                if not self.enable_bucket:
+                    control_pixel_values = self._to_non_bucket_video(control_pixel_values, self.video_sample_size)
+            else:
+                control_pixel_values = np.zeros_like(pixel_values) if self.enable_bucket else torch.zeros_like(pixel_values)
+            subject_image = None
+            return pixel_values, control_pixel_values, subject_image, control_camera_values, text, "video"
+
+        image = Image.open(self._resolve_path(pixel_path)).convert("RGB")
+        if self.enable_bucket:
+            pixel_values = np.expand_dims(np.array(image), 0)
+            pixel_values = self._resize_frames_to_larger_side(pixel_values)
+        else:
+            pixel_values = self.image_transforms(image).unsqueeze(0)
+        if control_path:
+            control_image = Image.open(self._resolve_path(control_path)).convert("RGB")
+            if self.enable_bucket:
+                control_pixel_values = np.expand_dims(np.array(control_image), 0)
+                control_pixel_values = self._resize_frames_to_larger_side(control_pixel_values)
+            else:
+                control_pixel_values = self.image_transforms(control_image).unsqueeze(0)
+        else:
+            control_pixel_values = np.zeros_like(pixel_values) if self.enable_bucket else torch.zeros_like(pixel_values)
+        subject_image = None
+        return pixel_values, control_pixel_values, subject_image, None, text, "image"
+
+    def __getitem__(self, index):
+        data_type = self.dataset[index % len(self.dataset)].get("type", "image")
+        while True:
+            try:
+                data_info = self.dataset[index % len(self.dataset)]
+                if data_info.get("type", "image") != data_type:
+                    raise ValueError("data_type_local != data_type")
+                pixel_values, control_pixel_values, subject_image, control_camera_values, text, data_type = self.get_batch(index)
+                sample = {
+                    "pixel_values": pixel_values,
+                    "control_pixel_values": control_pixel_values,
+                    "subject_image": subject_image,
+                    "text": text,
+                    "data_type": data_type,
+                    "idx": index,
+                }
+                if self.enable_camera_info:
+                    sample["control_camera_values"] = control_camera_values
+                if self.enable_inpaint and not self.enable_bucket:
+                    mask = get_random_mask(pixel_values.size()).to(pixel_values.device, dtype=pixel_values.dtype)
+                    sample["mask_pixel_values"] = pixel_values * (1 - mask)
+                    sample["mask"] = mask
+                    sample["clip_pixel_values"] = (pixel_values[0].permute(1, 2, 0).contiguous() * 0.5 + 0.5) * 255
+                return sample
+            except Exception as exc:
+                print(exc, self.dataset[index % len(self.dataset)])
+                index = random.randint(0, self.length - 1)
+
+
+class ImageVideoSampler(torch.utils.data.BatchSampler):
+    def __init__(self, sampler, dataset, batch_size, drop_last=True):
+        super().__init__(sampler, batch_size=batch_size, drop_last=drop_last)
+        self.dataset = dataset
+
+
+class AspectRatioBatchImageVideoSampler(ImageVideoSampler):
+    def __init__(self, sampler, dataset, batch_size, train_folder=None, drop_last=True, aspect_ratios=None):
+        super().__init__(sampler, dataset=dataset, batch_size=batch_size, drop_last=drop_last)
+        self.train_folder = train_folder
+        self.aspect_ratios = aspect_ratios
+
+
+def wan22fun_worker_init_fn(seed):
+    seed = seed * 256
+
+    def _worker_init_fn(worker_id):
+        worker_seed = seed + worker_id
+        np.random.seed(worker_seed)
+        random.seed(worker_seed)
+
+    return _worker_init_fn
+
+
+def _align_to_spatial_compression(size, spatial_compression_ratio=SPATIAL_COMPRESSION_RATIO):
+    return [max(spatial_compression_ratio * 2, int(x / spatial_compression_ratio / 2) * spatial_compression_ratio * 2) for x in size]
+
+
+def _get_closest_ratio(height, width, ratios):
+    src_ratio = height / max(width, 1)
+    best_key = min(ratios, key=lambda key: abs((ratios[key][0] / max(ratios[key][1], 1)) - src_ratio))
+    return ratios[best_key], best_key
+
+
+def _center_crop_video(video, size):
+    th, tw = int(size[0]), int(size[1])
+    _, _, h, w = video.shape
+    top = max((h - th) // 2, 0)
+    left = max((w - tw) // 2, 0)
+    return video[:, :, top: top + th, left: left + tw]
+
+
+def _resize_crop_normalize_video(video, sample_size, normalize=True):
+    if isinstance(sample_size, int):
+        sample_size = (sample_size, sample_size)
+    sample_size = tuple(int(x) for x in sample_size)
+    if video.dtype != torch.float32:
+        video = video.float()
+    if video.max() > 2:
+        video = video / 255.0
+    h, w = video.shape[-2:]
+    th, tw = sample_size
+    if th / tw > h / max(w, 1):
+        resize_size = (th, int(w * th / max(h, 1)))
+    else:
+        resize_size = (int(h * tw / max(w, 1)), tw)
+    video = F.interpolate(video, size=resize_size, mode="bilinear", align_corners=False)
+    video = _center_crop_video(video, sample_size)
+    if normalize:
+        video = video.sub(0.5).div(0.5)
+    return video
+
+
+def _get_length_to_frame_num(config, token_length):
+    image_sample_size = getattr(config, "image_sample_size", getattr(config, "video_sample_size", 704))
+    video_sample_size = getattr(config, "video_sample_size", image_sample_size)
+    interval = getattr(config, "sample_n_frames_bucket_interval", SAMPLE_N_FRAMES_BUCKET_INTERVAL)
+    if image_sample_size > video_sample_size:
+        sample_sizes = list(range(video_sample_size, image_sample_size + 1, 128))
+        if sample_sizes[-1] != image_sample_size:
+            sample_sizes.append(image_sample_size)
+    else:
+        sample_sizes = [image_sample_size]
+    video_sample_n_frames = getattr(config, "video_sample_n_frames", getattr(config, "num_frames", 121))
+    return {
+        sample_size: int(min(token_length / sample_size / sample_size, video_sample_n_frames) // interval * interval + 1)
+        for sample_size in sample_sizes
+    }
+
+
+def _get_random_downsample_ratio(sample_size, image_ratio=None, all_choices=False, rng=None):
+    image_ratio = image_ratio or []
+    if sample_size >= 1536:
+        number_list = [1, 1.25, 1.5, 2, 2.5, 3] + image_ratio
+    elif sample_size >= 1024:
+        number_list = [1, 1.25, 1.5, 2] + image_ratio
+    elif sample_size >= 768:
+        number_list = [1, 1.25, 1.5] + image_ratio
+    elif sample_size >= 512:
+        number_list = [1] + image_ratio
+    else:
+        number_list = [1]
+    if all_choices:
+        return number_list
+    if len(number_list) == 1:
+        probs = np.array([1.0])
+    else:
+        probs = np.array([0.90] + [(0.10 / (len(number_list) - 1))] * (len(number_list) - 1))
+    return (rng or np.random).choice(number_list, p=probs)
+
+
+def _get_random_downsample_probability(choice_list, token_sample_size):
+    if len(choice_list) == 1:
+        return [1.0]
+    closest_index = min(range(len(choice_list)), key=lambda i: abs(choice_list[i] - token_sample_size))
+    probs = [0.50 / (len(choice_list) - 1)] * len(choice_list)
+    probs[closest_index] = 0.50
+    return probs
+
+
+def wan22fun_collate_fn(config):
+    def _collate(examples):
+        video_sample_n_frames = int(getattr(config, "video_sample_n_frames", getattr(config, "num_frames", 121)))
+        video_sample_size = int(getattr(config, "video_sample_size", getattr(config, "h", 704)))
+        image_sample_size = int(getattr(config, "image_sample_size", video_sample_size))
+        token_sample_size = int(getattr(config, "token_sample_size", video_sample_size))
+        interval = int(getattr(config, "sample_n_frames_bucket_interval", SAMPLE_N_FRAMES_BUCKET_INTERVAL))
+        spatial_compression_ratio = int(getattr(config, "spatial_compression_ratio", SPATIAL_COMPRESSION_RATIO))
+        random_hw_adapt = bool(getattr(config, "random_hw_adapt", True))
+        training_with_video_token_length = bool(getattr(config, "training_with_video_token_length", True))
+        random_ratio_crop = bool(getattr(config, "random_ratio_crop", False))
+        fix_sample_size = getattr(config, "fix_sample_size", None)
+        train_mode = getattr(config, "train_mode", "control_ref")
+        control_ref_image = getattr(config, "control_ref_image", "first_frame")
+        add_inpaint_info = bool(getattr(config, "add_inpaint_info", False))
+
+        target_token_length = video_sample_n_frames * token_sample_size * token_sample_size
+        length_to_frame_num = _get_length_to_frame_num(config, target_token_length)
+
+        first_pixel_value = examples[0]["pixel_values"]
+        _, height, width, _ = np.shape(first_pixel_value)
+        if random_hw_adapt:
+            if training_with_video_token_length:
+                local_min_size = np.min(
+                    np.array([
+                        np.mean(np.array([np.shape(example["pixel_values"])[1], np.shape(example["pixel_values"])[2]]))
+                        for example in examples
+                    ])
+                )
+                choice_list = [size for size in length_to_frame_num if size < local_min_size * 1.25]
+                if len(choice_list) == 0:
+                    choice_list = list(length_to_frame_num.keys())
+                probabilities = _get_random_downsample_probability(choice_list, token_sample_size)
+                local_video_sample_size = np.random.choice(choice_list, p=probabilities)
+                random_downsample_ratio = video_sample_size / local_video_sample_size
+                batch_video_length = length_to_frame_num[local_video_sample_size]
+            else:
+                random_downsample_ratio = _get_random_downsample_ratio(video_sample_size)
+                batch_video_length = video_sample_n_frames + interval
+        else:
+            random_downsample_ratio = 1
+            batch_video_length = video_sample_n_frames + interval
+
+        aspect_ratio_sample_size = {
+            key: [x / 512 * video_sample_size / random_downsample_ratio for x in ASPECT_RATIO_512[key]]
+            for key in ASPECT_RATIO_512.keys()
+        }
+        aspect_ratio_random_crop_sample_size = {
+            key: [x / 512 * video_sample_size / random_downsample_ratio for x in ASPECT_RATIO_RANDOM_CROP_512[key]]
+            for key in ASPECT_RATIO_RANDOM_CROP_512.keys()
+        }
+
+        if fix_sample_size is not None:
+            sample_size = _align_to_spatial_compression(fix_sample_size, spatial_compression_ratio)
+        elif random_ratio_crop:
+            random_sample_size = aspect_ratio_random_crop_sample_size[
+                np.random.choice(list(aspect_ratio_random_crop_sample_size.keys()), p=ASPECT_RATIO_RANDOM_CROP_PROB)
+            ]
+            sample_size = _align_to_spatial_compression(random_sample_size, spatial_compression_ratio)
+        else:
+            closest_size, _ = _get_closest_ratio(height, width, ratios=aspect_ratio_sample_size)
+            sample_size = _align_to_spatial_compression(closest_size, spatial_compression_ratio)
+
+        min_example_length = min(example["pixel_values"].shape[0] for example in examples)
+        batch_video_length = int(min(batch_video_length, min_example_length))
+        batch_video_length = (batch_video_length - 1) // interval * interval + 1
+        batch_video_length = max(batch_video_length, 1)
+
+        batch = {
+            "target_token_length": target_token_length,
+            "pixel_values": [],
+            "control_pixel_values": [],
+            "text": [],
+            "prompts": [],
+        }
+        if train_mode != "control":
+            batch["ref_pixel_values"] = []
+            batch["clip_pixel_values"] = []
+            batch["clip_idx"] = []
+        if train_mode == "control_camera_ref":
+            batch["control_camera_values"] = []
+        if add_inpaint_info:
+            batch["mask_pixel_values"] = []
+            batch["mask"] = []
+
+        for example in examples:
+            pixel_values = torch.from_numpy(example["pixel_values"]).permute(0, 3, 1, 2).contiguous()
+            control_pixel_values = torch.from_numpy(example["control_pixel_values"]).permute(0, 3, 1, 2).contiguous()
+            pixel_values = _resize_crop_normalize_video(pixel_values, sample_size, normalize=True)
+            control_pixel_values = _resize_crop_normalize_video(control_pixel_values, sample_size, normalize=True)
+            pixel_values = pixel_values[:batch_video_length]
+            control_pixel_values = control_pixel_values[:batch_video_length]
+            batch["pixel_values"].append(pixel_values)
+            batch["control_pixel_values"].append(control_pixel_values)
+            batch["text"].append(example["text"])
+            batch["prompts"].append(example["text"])
+
+            if train_mode == "control_camera_ref":
+                control_camera_values = example.get("control_camera_values", None)
+                if control_camera_values is None:
+                    camera_values = torch.zeros(
+                        (
+                            batch_video_length,
+                            6,
+                            control_pixel_values.shape[-2],
+                            control_pixel_values.shape[-1],
+                        ),
+                        dtype=control_pixel_values.dtype,
+                    )
+                else:
+                    camera_values = torch.as_tensor(control_camera_values).permute(0, 3, 1, 2).contiguous().float()
+                    camera_values = _resize_crop_normalize_video(camera_values, sample_size, normalize=False)[:batch_video_length]
+                batch["control_camera_values"].append(camera_values)
+
+            if train_mode != "control":
+                if control_ref_image == "first_frame" or len(pixel_values) == 1:
+                    clip_idx = 0
+                else:
+                    probs = np.array([0.40] + [(0.60 / (len(pixel_values) - 1))] * (len(pixel_values) - 1))
+                    clip_idx = int(np.random.choice(list(range(len(pixel_values))), p=probs))
+                ref_pixel_values = pixel_values[clip_idx: clip_idx + 1]
+                clip_pixel_values = ((pixel_values[clip_idx].permute(1, 2, 0).contiguous() * 0.5 + 0.5) * 255.0)
+                batch["ref_pixel_values"].append(ref_pixel_values)
+                batch["clip_pixel_values"].append(clip_pixel_values)
+                batch["clip_idx"].append(clip_idx)
+
+            if add_inpaint_info:
+                mask = get_random_mask(pixel_values.size()).to(device=pixel_values.device, dtype=pixel_values.dtype)
+                mask_pixel_values = pixel_values * (1 - mask)
+                batch["mask_pixel_values"].append(mask_pixel_values)
+                batch["mask"].append(mask)
+
+        batch["pixel_values"] = torch.stack(batch["pixel_values"])
+        batch["control_pixel_values"] = torch.stack(batch["control_pixel_values"])
+        if train_mode != "control":
+            batch["ref_pixel_values"] = torch.stack(batch["ref_pixel_values"])
+            batch["clip_pixel_values"] = torch.stack(batch["clip_pixel_values"])
+            batch["clip_idx"] = torch.tensor(batch["clip_idx"], dtype=torch.long)
+        if train_mode == "control_camera_ref":
+            batch["control_camera_values"] = torch.stack(batch["control_camera_values"])
+        if add_inpaint_info:
+            batch["mask_pixel_values"] = torch.stack(batch["mask_pixel_values"])
+            batch["mask"] = torch.stack(batch["mask"])
+        return batch
+
+    return _collate
+
+
 class ODERegressionCSVDataset(Dataset):
     def __init__(self, data_path: str, max_pair: int = int(1e8), num_frames=81, h=480, w=832):
         self.max_pair = max_pair
+        self.data_path = Path(data_path)
         self.data = pd.read_csv(data_path)
+        if "text" not in self.data.columns:
+            raise ValueError(
+                f"Dataset CSV {data_path} must contain a 'text' column. "
+                f"Available columns: {list(self.data.columns)}"
+            )
+        if "path" not in self.data.columns and "video_path" in self.data.columns:
+            self.data["path"] = self.data["video_path"]
+        if "path" not in self.data.columns:
+            raise ValueError(
+                f"Dataset CSV {data_path} must contain a 'path' or 'video_path' column. "
+                f"Available columns: {list(self.data.columns)}"
+            )
         self.data["text"] = self.data["text"].fillna("")
         self.log_file = "log/datasets_error_log.txt"
+        os.makedirs(os.path.dirname(self.log_file), exist_ok=True)
         self.num_frames = num_frames
         self.h = h
         self.w = w
@@ -282,8 +898,10 @@ class ODERegressionCSVDataset(Dataset):
         return len(self.data)
 
     def _preprocess_video(self, sample) -> torch.Tensor:
-        path = sample["path"]
-        num_frames = sample["num_frames"]
+        path = str(sample["path"])
+        if not os.path.isabs(path) and not os.path.exists(path):
+            path = os.path.join(self.data_path.parent, path)
+        num_frames = int(sample["num_frames"])
         if num_frames < self.num_frames:
             raise ValueError(f"Error: num_frames < {self.num_frames}")
         frame_indices = list(range(self.num_frames))

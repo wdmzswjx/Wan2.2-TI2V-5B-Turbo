@@ -98,17 +98,25 @@ class EMA_FSDP:
     @torch.no_grad()
     def _init_shadow(self, fsdp_module):
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-        with FSDP.summon_full_params(fsdp_module, writeback=False, offload_to_cpu=True):
-            for n, p in fsdp_module.module.named_parameters():
-                self.shadow[n] = p.detach().clone().float().cpu()
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        with FSDP.summon_full_params(
+            fsdp_module, writeback=False, offload_to_cpu=True, rank0_only=True
+        ):
+            if rank == 0:
+                for n, p in fsdp_module.module.named_parameters():
+                    self.shadow[n] = p.detach().clone().float().cpu()
 
     @torch.no_grad()
     def update(self, fsdp_module):
         d = self.decay
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-        with FSDP.summon_full_params(fsdp_module, writeback=False, offload_to_cpu=True):
-            for n, p in fsdp_module.module.named_parameters():
-                self.shadow[n].mul_(d).add_(p.detach().float().cpu(), alpha=1. - d)
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        with FSDP.summon_full_params(
+            fsdp_module, writeback=False, offload_to_cpu=True, rank0_only=True
+        ):
+            if rank == 0:
+                for n, p in fsdp_module.module.named_parameters():
+                    self.shadow[n].mul_(d).add_(p.detach().float().cpu(), alpha=1. - d)
 
     # Optional helpers ---------------------------------------------------
     def state_dict(self):
