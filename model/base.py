@@ -43,7 +43,12 @@ class BaseModel(nn.Module):
         self.fake_model_name = getattr(args, "fake_name", "Wan2.1-T2V-14B")
         self.generator_name = getattr(args, "generator_name", "Wan2.1-T2V-14B")
         model_kwargs = getattr(args, "model_kwargs", {})
-        score_model_kwargs = model_kwargs if getattr(args, "distribution_loss", None) in ("wan22fun", "wan22fun_dmd") else {}
+        score_model_kwargs = model_kwargs if getattr(args, "distribution_loss", None) in (
+            "wan22fun",
+            "wan22fun_dmd",
+            "wan22r",
+            "wan22r_dmd",
+        ) else {}
         wrapper_cache = {}
 
         def get_wrapper(model_name, is_causal, kwargs):
@@ -247,6 +252,8 @@ class SelfForcingModel(BaseModel):
         y_camera: torch.Tensor = None,
         full_ref: torch.Tensor = None,
         wan22_image_latent: torch.Tensor = None,
+        condition_latent: torch.Tensor = None,
+        condition_mask: torch.Tensor = None,
         **conditional_dict: dict
     ) -> torch.Tensor:
         """
@@ -265,7 +272,15 @@ class SelfForcingModel(BaseModel):
             self._initialize_inference_pipeline()
 
         return self.inference_pipeline.inference_with_trajectory(
-            noise=noise, clip_fea=clip_fea, y=y, y_camera=y_camera, full_ref=full_ref, wan22_image_latent=wan22_image_latent, **conditional_dict
+            noise=noise,
+            clip_fea=clip_fea,
+            y=y,
+            y_camera=y_camera,
+            full_ref=full_ref,
+            wan22_image_latent=wan22_image_latent,
+            condition_latent=condition_latent,
+            condition_mask=condition_mask,
+            **conditional_dict,
         )
 
     def _initialize_inference_pipeline(self):

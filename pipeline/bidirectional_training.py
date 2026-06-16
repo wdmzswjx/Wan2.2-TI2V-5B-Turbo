@@ -81,7 +81,18 @@ class BidirectionalTrainingPipeline(torch.nn.Module):
                 return stacked.to(device=reference.device, dtype=reference.dtype)
         return None
 
-    def inference_with_trajectory(self, noise: torch.Tensor, clip_fea, y, y_camera=None, full_ref=None, wan22_image_latent=None, **conditional_dict) -> torch.Tensor:
+    def inference_with_trajectory(
+        self,
+        noise: torch.Tensor,
+        clip_fea=None,
+        y=None,
+        y_camera=None,
+        full_ref=None,
+        wan22_image_latent=None,
+        condition_latent=None,
+        condition_mask=None,
+        **conditional_dict,
+    ) -> torch.Tensor:
         """
         Perform inference on the given noise and text prompts.
         Inputs:
@@ -106,7 +117,23 @@ class BidirectionalTrainingPipeline(torch.nn.Module):
                 device=noise.device,
                 dtype=torch.int64) * current_timestep
             
-            if "2.2" in self.generator.model_name:
+            if condition_mask is not None:
+                mask2 = condition_mask.to(device=noise.device, dtype=noise.dtype)
+                clean_condition = condition_latent.to(device=noise.device, dtype=noise.dtype)
+                noisy_image_or_video = mask2 * noisy_image_or_video + (1. - mask2) * clean_condition
+                noisy_image_or_video = noisy_image_or_video.to(noise.device, dtype=noise.dtype)
+                seq_len = self.generator.get_seq_len(noisy_image_or_video)
+
+                wan22_input_timestep = torch.tensor([timestep[0][0].item()], device=noise.device, dtype=noise.dtype)
+                temp_ts = (mask2[:, :, 0, ::2, ::2] * wan22_input_timestep)
+                temp_ts = temp_ts.reshape(temp_ts.shape[0], -1)
+                temp_ts = torch.cat([
+                    temp_ts,
+                    temp_ts.new_ones(temp_ts.size(0), seq_len - temp_ts.size(1)) * wan22_input_timestep,
+                ], dim=1)
+                wan22_input_timestep = temp_ts.to(noise.device, dtype=torch.long)
+                control_image_latent = clean_condition
+            elif "2.2" in self.generator.model_name:
                 mask1, mask2 = masks_like(noisy_image_or_video, zero=True)
                 mask2 = torch.stack(mask2, dim=0) # torch.Size([1, 31, 48, 44, 80])
                 control_image_latent = self._image_latent_from_control_y(y, noisy_image_or_video)
@@ -151,7 +178,9 @@ class BidirectionalTrainingPipeline(torch.nn.Module):
                         sigma_current = self._sigma_for_timestep(timestep, noisy_image_or_video)
                         pred_epsilon = noisy_image_or_video + (1 - sigma_current) * flow_pred
                         noisy_image_or_video = (1 - sigma_next) * denoised_pred + sigma_next * pred_epsilon
-                        if mask2 is not None and control_image_latent is not None:
+                        if condition_mask is not None and condition_latent is not None:
+                            noisy_image_or_video = mask2 * noisy_image_or_video + (1. - mask2) * clean_condition
+                        elif mask2 is not None and control_image_latent is not None:
                             noisy_image_or_video = (1. - mask2) * control_image_latent + mask2 * noisy_image_or_video
                     else:
                         noisy_image_or_video = self.scheduler.add_noise(

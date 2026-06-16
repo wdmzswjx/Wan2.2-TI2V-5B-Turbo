@@ -1,0 +1,100 @@
+# Wan22R DMD distillation built on this repository's score-distillation framework.
+# It uses trainer/wan22r_distillation.py and model.Wan22RDMD.
+
+i2v: false
+generator_fsdp_wrap_strategy: size
+real_score_fsdp_wrap_strategy: size
+fake_score_fsdp_wrap_strategy: size
+real_name: Wan2.2-TI2V-5B
+fake_name: Wan2.2-TI2V-5B
+generator_type: bidirectional
+generator_name: Wan2.2-TI2V-5B
+text_encoder_fsdp_wrap_strategy: size
+image_encoder_fsdp_wrap_strategy: size
+text_encoder_cpu_offload: true
+
+denoising_step_list:
+- 1000
+- 750
+- 500
+- 250
+warp_denoising_step: true
+
+ts_schedule: false
+num_train_timestep: 1000
+timestep_shift: 5.0
+guidance_scale: 6.0
+denoising_loss_type: x0
+mixed_precision: true
+seed: 0
+
+wandb_host: WANDB_HOST
+wandb_key: WANDB_KEY
+wandb_entity: WANDB_ENTITY
+wandb_project: WANDB_PROJECT
+sharding_strategy: full
+lr: 5.0e-07
+lr_critic: 1.0e-07
+beta1: 0.0
+beta2: 0.999
+beta1_critic: 0.0
+beta2_critic: 0.999
+batch_size: 1
+ema_weight: 0.99
+ema_start_step: 200
+total_batch_size: 64
+log_iters: 500
+max_checkpoints_to_keep: 5
+
+negative_prompt: '色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走'
+dfake_gen_update_ratio: 5
+
+# Select the new repo-native method.
+distribution_loss: wan22r
+trainer: score_distillation_wan22r
+gradient_checkpointing: true
+load_raw_video: false
+model_kwargs:
+  timestep_shift: 5.0
+  use_wan22fun_model: true
+  pretrained_model_name_or_path: wan_models/Wan2.2-TI2V-5B
+  transformer_sub_path: transformer
+  transformer_path:
+  transformer_additional_kwargs: {}
+initial_step: 0
+
+# Wan22R keeps R reference frames + V visible frames clean and distills the
+# remaining target frames. Dataset construction is delegated to your factory.
+use_wan22fun_dataloader: false
+train_data_meta: data/3dgs_1110_with_skybox_fake/metadata.json
+train_data_dir: .
+video_sample_size: 704
+image_sample_size: 704
+video_sample_stride: 1
+video_sample_n_frames: 121
+video_repeat: 1
+text_drop_ratio: 0.1
+video_length_drop_start: 0.1
+video_length_drop_end: 0.9
+enable_bucket: true
+random_hw_adapt: true
+training_with_video_token_length: true
+token_sample_size: 704
+sample_n_frames_bucket_interval: 4
+spatial_compression_ratio: 16
+random_ratio_crop: false
+fix_sample_size:
+control_ref_image: first_frame
+add_inpaint_info: true
+enable_subject_info: false
+dataloader_num_workers: 8
+train_mode: control_ref
+
+# Wan22R uses your existing dataloader. The factory must return an iterable
+# whose batches contain video [B,C,F,H,W], optional ref_images [B,C,R,H,W],
+# and text [B,L,D] prompt embeddings.
+wan22r_dataloader_target: your_package.your_module.build_train_dataloader
+wan22r_dataloader_kwargs: {}
+wan22r_ref_prob: 0.5
+wan22r_max_ref_images: 4
+wan22r_visible_frames: 1
